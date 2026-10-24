@@ -1,0 +1,37 @@
+plugins {
+    id "com.android.application"
+}
+
+def gameRoot = rootDir.parentFile
+def engineRoot = new File(gameRoot, "third_party/gbarecomp")
+def recompUiRoot = new File(gameRoot, "third_party/recomp-ui")
+
+ext.gbaGame = [
+    applicationId : "com.kirby.amazingmirror",
+    versionCode   : 1,
+    versionName   : "0.1.0",
+    title         : "Kirby & The Amazing Mirror",
+    romLabel      : "Kirby & The Amazing Mirror (USA) ROM",
+    romSha1       : ["274b102b6d940f46861a92b4e65f89a51815c12c"],
+    romSize       : 16777216,
+    romFile       : "kirby_amazing_mirror.gba",
+    biosRequired  : true,
+    orientation   : "landscape-locked",
+    gyro          : false,
+    payloadVersion: "4",
+    setupNote     : "Selecciona tu ROM y un BIOS de GBA limpio. HLE esta activado, pero el runtime tambien necesita cargar el archivo BIOS.",
+    variant       : "kirby_amazing_mirror",
+    gameToml      : new File(gameRoot, "game.toml"),
+    gameRoot      : gameRoot,
+    engineRoot    : engineRoot,
+    recompUiRoot  : recompUiRoot,
+    payloadDirs   : [[from: new File(gameRoot, "assets"), into: "assets"]],
+    cmakeArguments: [
+        "-DGBARECOMP_TOMLPP_INCLUDE_DIR=${new File(engineRoot, 'third_party/tomlpp').absolutePath.replace('\\', '/')}",
+    ],
+    releaseAbis   : ["arm64-v8a"],
+    debugAbis     : ["arm64-v8a"],
+    nativeJobs    : 2,
+]
+
+apply from: new File(engineRoot, "platform/android/gbarecomp-app.gradle")

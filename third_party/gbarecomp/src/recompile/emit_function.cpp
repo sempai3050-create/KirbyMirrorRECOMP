@@ -1,0 +1,699 @@
+// emit_function.cpp — see emit_function.h.
+//
+// Verbatim extraction of the per-function emitter that lived in
+// tools/gba_recompile/main.cpp. The only change vs the original is that
+// output goes to a std::string (via a printf-style appender) instead of a
+// FILE* — the format strings are identical, so the bytes are identical.
+
+#include "emit_function.h"
+
+#include <cstdarg>
+#include <algorithm>
+#include <unordered_set>
+
+#include "arm_codegen.h"
+#include "arm_decode.h"
+#include "thumb_decode.h"
+#include "arm_ir.h"
+
+namespace gbarecomp {
+
+namespace {
+
+// printf-style append with the exact semantics of std::fprintf, so the
+// emitted bytes match the offline tool's historical output exactly.
+void appendf(std::string& out, const char* fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (static_cast<std::size_t>(n) < sizeof(buf)) {
+        out.append(buf, static_cast<std::size_t>(n));
+        return;
+    }
+    std::string big(static_cast<std::size_t>(n) + 1u, '\0');
+    va_start(ap, fmt);
+    std::vsnprintf(&big[0], big.size(), fmt, ap);
+    va_end(ap);
+    out.append(big.data(), static_cast<std::size_t>(n));
+}
+
+// Guest regions whose bytes cannot change after load: BIOS and the three
+// cartridge ROM wait-state mirrors.
+bool immutable_code_region(uint32_t pc) {
+    return pc < 0x00004000u || (pc >= 0x08000000u && pc < 0x0E000000u);
+}
+
+bool decode_image_instr(const uint8_t* image, std::size_t image_size,
+                        uint32_t image_base, uint32_t pc, bool thumb,
+                        armv4t::Instr* out) {
+    const uint32_t len = thumb ? 2u : 4u;
+    if (pc < image_base) return false;
+    const uint64_t off = static_cast<uint64_t>(pc - image_base);
+    if (off + len > image_size) return false;
+    const uint8_t* p = image + off;
+    if (thumb) {
+        *out = armv4t::ThumbDecoder::decode(
+            static_cast<uint16_t>(p[0] | (p[1] << 8)), pc);
+    } else {
+        *out = armv4t::ArmDecoder::decode(
+            static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+            (static_cast<uint32_t>(p[2]) << 16) |
+            (static_cast<uint32_t>(p[3]) << 24), pc);
+    }
+    return true;
+}
+
+enum class LinkUse { Reads, Writes, Neither, Unknown };
+
+bool op2_reads(const armv4t::Op2& op2, uint8_t reg) {
+    if (op2.kind != armv4t::Op2::Kind::Shifted) return false;
+    return op2.shifted.rm == reg ||
+           (op2.shifted.by_register && op2.shifted.imm_or_rs == reg);
+}
+
+// How one non-control-flow instruction uses LR. Writes only count when the
+// instruction executes unconditionally; a conditional write may not happen.
+LinkUse classify_link_use(const armv4t::Instr& ins) {
+    using armv4t::IrOp;
+    constexpr uint8_t lr = 14;
+    const bool always = ins.cond == armv4t::Cond::AL;
+    auto write = [&](bool writes) {
+        return writes && always ? LinkUse::Writes : LinkUse::Neither;
+    };
+    switch (ins.op) {
+        case IrOp::MOV: case IrOp::MVN:
+            if (op2_reads(ins.op2, lr)) return LinkUse::Reads;
+            return write(ins.rd == lr);
+        case IrOp::AND: case IrOp::EOR: case IrOp::SUB: case IrOp::RSB:
+        case IrOp::ADD: case IrOp::ADC: case IrOp::SBC: case IrOp::RSC:
+        case IrOp::ORR: case IrOp::BIC:
+            if (ins.rn == lr || op2_reads(ins.op2, lr)) return LinkUse::Reads;
+            return write(ins.rd == lr);
+        case IrOp::TST: case IrOp::TEQ: case IrOp::CMP: case IrOp::CMN:
+            return (ins.rn == lr || op2_reads(ins.op2, lr)) ? LinkUse::Reads
+                                                           : LinkUse::Neither;
+        case IrOp::LDR: case IrOp::LDRB: case IrOp::LDRH:
+        case IrOp::LDRSB: case IrOp::LDRSH:
+            if (ins.mem.rn == lr ||
+                (ins.mem.by_register && ins.mem.reg_offset.rm == lr))
+                return LinkUse::Reads;
+            return write(ins.rd == lr);
+        case IrOp::STR: case IrOp::STRB: case IrOp::STRH:
+            return (ins.rd == lr || ins.mem.rn == lr ||
+                    (ins.mem.by_register && ins.mem.reg_offset.rm == lr))
+                ? LinkUse::Reads : LinkUse::Neither;
+        case IrOp::LDM:
+            // User-bank transfers touch a different LR; be conservative.
+            if (ins.block.s_bit) return LinkUse::Unknown;
+            if (ins.block.rn == lr) return LinkUse::Reads;
+            return write((ins.block.reg_list & (1u << lr)) != 0);
+        case IrOp::STM:
+            if (ins.block.s_bit) return LinkUse::Unknown;
+            return (ins.block.rn == lr ||
+                    (ins.block.reg_list & (1u << lr)) != 0)
+                ? LinkUse::Reads : LinkUse::Neither;
+        case IrOp::SWP: case IrOp::SWPB:
+            if (ins.rn == lr || ins.rm == lr) return LinkUse::Reads;
+            return write(ins.rd == lr);
+        case IrOp::MUL: case IrOp::MLA: case IrOp::UMULL: case IrOp::UMLAL:
+        case IrOp::SMULL: case IrOp::SMLAL:
+            // Field roles differ per multiply form; any LR operand is live.
+            return (ins.rd == lr || ins.rn == lr || ins.rs == lr ||
+                    ins.rm == lr) ? LinkUse::Reads : LinkUse::Neither;
+        case IrOp::MRS:
+            return write(ins.rd == lr);
+        default:
+            return LinkUse::Unknown;
+    }
+}
+
+bool link_dead_from(const uint8_t* image, std::size_t image_size,
+                    uint32_t image_base, uint32_t pc, bool thumb,
+                    std::unordered_set<uint32_t>& visited, unsigned& budget) {
+    using armv4t::IrOp;
+    const uint32_t step = thumb ? 2u : 4u;
+    for (;;) {
+        // A path that loops back without reading LR never observes it.
+        if (!visited.insert(pc).second) return true;
+        if (budget == 0 || !immutable_code_region(pc)) return false;
+        --budget;
+        armv4t::Instr ins;
+        if (!decode_image_instr(image, image_size, image_base, pc, thumb, &ins))
+            return false;
+        if (ins.is_undefined || ins.op == IrOp::Undefined) return false;
+        switch (ins.op) {
+            case IrOp::BL_prefix:
+                return true;  // LR = PC + offset: written, never read
+            case IrOp::BL:
+                if (ins.cond == armv4t::Cond::AL) return true;
+                return false;
+            case IrOp::B:
+                if (ins.cond == armv4t::Cond::AL) {
+                    pc = ins.branch_target;
+                    continue;
+                }
+                return link_dead_from(image, image_size, image_base,
+                                      ins.branch_target, thumb, visited,
+                                      budget) &&
+                       link_dead_from(image, image_size, image_base,
+                                      pc + step, thumb, visited, budget);
+            default:
+                break;
+        }
+        // Every other PC write (BX, LDM/LDR/DP into PC) and SWI/MSR/BL_suffix
+        // is an unknown continuation or LR bank change.
+        if (ins.is_pc_writing || ins.is_branch || ins.op == IrOp::SWI ||
+            ins.op == IrOp::MSR || ins.op == IrOp::BL_suffix)
+            return false;
+        switch (classify_link_use(ins)) {
+            case LinkUse::Reads: case LinkUse::Unknown: return false;
+            case LinkUse::Writes: return true;
+            case LinkUse::Neither: break;
+        }
+        pc += step;
+    }
+}
+
+}  // namespace
+
+bool link_register_dead_at(const uint8_t* image, std::size_t image_size,
+                           uint32_t image_base, uint32_t target, bool thumb) {
+    if (!image || !immutable_code_region(target)) return false;
+    std::unordered_set<uint32_t> visited;
+    unsigned budget = 256;
+    return link_dead_from(image, image_size, image_base, target & ~1u, thumb,
+                          visited, budget);
+}
+
+std::string emit_function_body_str(
+    const Function& fn, const uint8_t* rom, std::size_t rom_size,
+    uint32_t rom_base,
+    const std::unordered_map<uint64_t, std::string>& func_names_by_key,
+    const std::unordered_set<uint32_t>*
+        alu_immediate_override_pcs,
+    const std::unordered_set<uint64_t>* mod_function_hook_keys,
+    bool runtime_ram_placement) {
+    std::string out;
+
+    const uint32_t step = (fn.mode == CpuMode::Thumb) ? 2u : 4u;
+    armv4t::CodegenCtx ctx;
+    ctx.names_by_key = &func_names_by_key;
+    ctx.current_function_addr = fn.addr;
+    ctx.current_function_end_addr = fn.end_addr;
+    ctx.current_function_thumb = (fn.mode == CpuMode::Thumb);
+    if (runtime_ram_placement) {
+        ctx.runtime_pc_base = "_ram_base";
+        appendf(out, "    const uint32_t _ram_base = g_runtime_native_ram_base;\n");
+        // The same fragment may be placed at several guest PCs. Preserve only
+        // exact reviewed mod sites in its live bus class, including a fresh
+        // call whose instruction is an interior alias of this fragment.
+        std::vector<uint32_t> reviewed;
+        if (mod_function_hook_keys) for (uint64_t key : *mod_function_hook_keys) {
+            if (bool(key & 1u)!=ctx.current_function_thumb) continue;
+            const uint32_t site=uint32_t(key>>1),region=site>>24;
+            const bool ram=(fn.addr>>24)==2u || (fn.addr>>24)==3u;
+            if (ram ? (region==2u || region==3u) :
+                (region>=8u && region<=13u && (site & 0x01FFFFFFu)<0x2000u))
+                reviewed.push_back(site);
+        }
+        if (!reviewed.empty()) {
+            std::sort(reviewed.begin(),reviewed.end());
+            appendf(out,"    const uint32_t _native_entry = _ram_base + "
+                "(g_runtime_resume_pc ? g_runtime_resume_pc - 0x%08Xu : 0u);\n"
+                "    switch (_native_entry) {\n",fn.addr);
+            for (uint32_t site : reviewed) appendf(out,"    case 0x%08Xu:\n",site);
+            appendf(out,"        if (gba_mod_function_entry(_native_entry, %du, &g_cpu)) {\n"
+                "            g_runtime_resume_pc = 0u; return;\n"
+                "        }\n        break;\n    default: break;\n    }\n",
+                ctx.current_function_thumb ? 1 : 0);
+        }
+    }
+    ctx.alu_immediate_override_pcs = alu_immediate_override_pcs;
+    const uint32_t fn_source_addr = fn.source_addr ? fn.source_addr : fn.addr;
+    std::vector<FunctionBlock> blocks = fn.switch_blocks;
+    blocks.push_back({fn.addr, fn.end_addr});
+    std::sort(blocks.begin(), blocks.end(), [](const auto& a, const auto& b) {
+        return a.start < b.start;
+    });
+    std::vector<FunctionBlock> spans;
+    for (const auto& block : blocks) {
+        if (!spans.empty() && block.start <= spans.back().end)
+            spans.back().end = std::max(spans.back().end, block.end);
+        else
+            spans.push_back(block);
+    }
+
+    auto source_offset_for = [&](uint32_t guest_pc, uint32_t len,
+                                 std::size_t* out_off) -> bool {
+        int64_t delta = static_cast<int64_t>(guest_pc) -
+            static_cast<int64_t>(fn.addr);
+        int64_t source_pc = static_cast<int64_t>(fn_source_addr) + delta;
+        if (source_pc < static_cast<int64_t>(rom_base)) return false;
+        uint64_t off64 = static_cast<uint64_t>(
+            source_pc - static_cast<int64_t>(rom_base));
+        if (off64 + len > rom_size) return false;
+        *out_off = static_cast<std::size_t>(off64);
+        return true;
+    };
+
+    auto plain_reg_source = [](const armv4t::Instr& ins, uint8_t* rm) {
+        if (ins.op != armv4t::IrOp::MOV ||
+            ins.op2.kind != armv4t::Op2::Kind::Shifted ||
+            ins.op2.shifted.by_register ||
+            ins.op2.shifted.type != armv4t::ShiftType::LSL ||
+            ins.op2.shifted.imm_or_rs != 0) {
+            return false;
+        }
+        *rm = ins.op2.shifted.rm;
+        return true;
+    };
+
+    auto invalidate_written_aliases = [](const armv4t::Instr& ins,
+                                         bool alias[16]) {
+        auto clear = [&](uint8_t reg) {
+            if (reg < 16) alias[reg] = false;
+        };
+
+        switch (ins.op) {
+            case armv4t::IrOp::AND: case armv4t::IrOp::EOR:
+            case armv4t::IrOp::SUB: case armv4t::IrOp::RSB:
+            case armv4t::IrOp::ADD: case armv4t::IrOp::ADC:
+            case armv4t::IrOp::SBC: case armv4t::IrOp::RSC:
+            case armv4t::IrOp::ORR: case armv4t::IrOp::MOV:
+            case armv4t::IrOp::BIC: case armv4t::IrOp::MVN:
+            case armv4t::IrOp::LDR: case armv4t::IrOp::LDRB:
+            case armv4t::IrOp::LDRH: case armv4t::IrOp::LDRSB:
+            case armv4t::IrOp::LDRSH: case armv4t::IrOp::SWP:
+            case armv4t::IrOp::SWPB: case armv4t::IrOp::MRS:
+                clear(ins.rd);
+                break;
+            case armv4t::IrOp::MUL: case armv4t::IrOp::MLA:
+                clear(ins.rd);
+                break;
+            case armv4t::IrOp::UMULL: case armv4t::IrOp::UMLAL:
+            case armv4t::IrOp::SMULL: case armv4t::IrOp::SMLAL:
+                clear(ins.rd);
+                clear(ins.rn);
+                break;
+            case armv4t::IrOp::LDM:
+                if (ins.block.load) {
+                    for (uint8_t reg = 0; reg < 16; ++reg) {
+                        if (ins.block.reg_list & (1u << reg)) {
+                            clear(reg);
+                        }
+                    }
+                }
+                break;
+            case armv4t::IrOp::BL:
+            case armv4t::IrOp::BL_prefix:
+            case armv4t::IrOp::BL_suffix:
+                clear(14);
+                break;
+            default:
+                break;
+        }
+    };
+
+    // Stage 2 idle-loop elision: an instruction is "idle-simple" if it can
+    // appear inside a quiescent (busy-wait) loop body without making the loop
+    // unsafe to fast-forward — i.e. it has no architecturally-visible side
+    // effect beyond writing a non-PC GP register / flags, and never transfers
+    // control. Allowed: data-processing / MOV, single-register loads, the
+    // multiplies, and MRS. Rejected (unsafe → ends an idle-candidate body):
+    // any store (STR*/STM/SWP*), any call or branch (BL*/BX/BLX/B), LDM (may
+    // load PC, multi-reg), SWI, MSR (mode/interrupt change), and any op that
+    // writes PC (rd == 15). The single back-edge branch that closes the loop
+    // is evaluated for eligibility BEFORE it is itself classified unsafe.
+    auto is_idle_simple = [](const armv4t::Instr& ins) -> bool {
+        switch (ins.op) {
+            // Comparisons write only flags — always safe.
+            case armv4t::IrOp::TST: case armv4t::IrOp::TEQ:
+            case armv4t::IrOp::CMP: case armv4t::IrOp::CMN:
+                return true;
+            // GP-writing data processing / MOV / loads / MRS — safe unless
+            // they write PC.
+            case armv4t::IrOp::AND: case armv4t::IrOp::EOR:
+            case armv4t::IrOp::SUB: case armv4t::IrOp::RSB:
+            case armv4t::IrOp::ADD: case armv4t::IrOp::ADC:
+            case armv4t::IrOp::SBC: case armv4t::IrOp::RSC:
+            case armv4t::IrOp::ORR: case armv4t::IrOp::MOV:
+            case armv4t::IrOp::BIC: case armv4t::IrOp::MVN:
+            case armv4t::IrOp::LDR: case armv4t::IrOp::LDRB:
+            case armv4t::IrOp::LDRH: case armv4t::IrOp::LDRSB:
+            case armv4t::IrOp::LDRSH: case armv4t::IrOp::MRS:
+                return ins.rd != 15;
+            case armv4t::IrOp::MUL: case armv4t::IrOp::MLA:
+                return ins.rd != 15;
+            case armv4t::IrOp::UMULL: case armv4t::IrOp::UMLAL:
+            case armv4t::IrOp::SMULL: case armv4t::IrOp::SMLAL:
+                return ins.rd != 15 && ins.rn != 15;
+            default:
+                // Stores, SWP/SWPB, LDM, all branches, SWI, MSR, Undefined.
+                return false;
+        }
+    };
+
+    std::unordered_set<uint32_t> backward_targets;
+    std::unordered_set<uint32_t> idle_backedge_pcs;
+    // Highest PC of any non-idle-simple instruction seen so far in the forward
+    // scan (-1 = none yet). A backward branch at P→T closes an idle-eligible
+    // straight-line body iff no unsafe instruction lies in [T, P): last_unsafe
+    // < T. Updated at the END of each scan step so it reflects only
+    // instructions strictly before the current one.
+    int64_t last_unsafe_pc = -1;
+    std::unordered_set<uint32_t> bx_c_return_pcs;
+    std::unordered_map<uint32_t, uint32_t> link_branch_targets;
+    bool lr_alias[16] = {};
+    lr_alias[14] = true;
+    armv4t::Instr prev_scan_ins{};
+    bool have_prev_scan_ins = false;
+
+    // Function boundaries can split compact THUMB epilogues:
+    //
+    //   pop {r3}
+    //   bx  r3
+    //
+    // If the finder discovered the BX as a separate entry, the scan below
+    // starts at the BX and would otherwise miss the stack-pop return idiom.
+    // Seed the previous instruction from ROM so the first decoded instruction
+    // in this function can still be classified correctly.
+    if (!runtime_ram_placement && fn_source_addr >= rom_base &&
+        (fn_source_addr - rom_base) >= step) {
+        const uint32_t prev_pc = fn.addr - step;
+        std::size_t prev_off = 0;
+        if (source_offset_for(prev_pc, step, &prev_off)) {
+            if (fn.mode == CpuMode::Thumb) {
+                uint16_t hw = static_cast<uint16_t>(
+                    rom[prev_off] | (rom[prev_off + 1] << 8));
+                prev_scan_ins = armv4t::ThumbDecoder::decode(hw, prev_pc);
+            } else {
+                uint32_t w = static_cast<uint32_t>(rom[prev_off])
+                    | (static_cast<uint32_t>(rom[prev_off + 1]) << 8)
+                    | (static_cast<uint32_t>(rom[prev_off + 2]) << 16)
+                    | (static_cast<uint32_t>(rom[prev_off + 3]) << 24);
+                prev_scan_ins = armv4t::ArmDecoder::decode(w, prev_pc);
+            }
+            have_prev_scan_ins = true;
+        }
+    }
+
+    for (const auto& span : spans) {
+        // Disjoint cases have independent register provenance and idle-loop state.
+        have_prev_scan_ins = span.start == fn.addr && have_prev_scan_ins;
+        for (bool& alias : lr_alias) alias = false;
+        lr_alias[14] = true;
+        last_unsafe_pc = static_cast<int64_t>(span.start) - 1;
+        for (uint32_t scan_pc = span.start; scan_pc < span.end; scan_pc += step) {
+            std::size_t scan_off = 0;
+            if (!source_offset_for(scan_pc, step, &scan_off)) break;
+            armv4t::Instr scan_ins;
+            if (fn.mode == CpuMode::Thumb) {
+                uint16_t hw = static_cast<uint16_t>(
+                    rom[scan_off] | (rom[scan_off + 1] << 8));
+                scan_ins = armv4t::ThumbDecoder::decode(hw, scan_pc);
+            } else {
+                uint32_t w = static_cast<uint32_t>(rom[scan_off])
+                    | (static_cast<uint32_t>(rom[scan_off + 1]) << 8)
+                    | (static_cast<uint32_t>(rom[scan_off + 2]) << 16)
+                    | (static_cast<uint32_t>(rom[scan_off + 3]) << 24);
+                scan_ins = armv4t::ArmDecoder::decode(w, scan_pc);
+            }
+            if (scan_ins.op == armv4t::IrOp::B &&
+                scan_ins.branch_target >= span.start &&
+                scan_ins.branch_target < span.end &&
+                scan_ins.branch_target < scan_pc) {
+                backward_targets.insert(scan_ins.branch_target);
+                // Stage 2: this back-edge closes an idle-elision candidate iff the
+                // straight-line body [target, scan_pc) is all idle-simple, i.e. no
+                // unsafe instruction precedes it back to the target. (last_unsafe_pc
+                // currently reflects instructions strictly before scan_pc, since it
+                // is updated at the end of the step below.)
+                if (last_unsafe_pc < static_cast<int64_t>(scan_ins.branch_target)) {
+                    idle_backedge_pcs.insert(scan_pc);
+                }
+            }
+            // Far-branch BLs: the link value is dead at the target, so no guest
+            // return can consume it. Lower them as branches so they never leave a
+            // host call-return frame behind (MKSC's per-frame main loops re-enter
+            // their loop head with `bl`; under suspended multiplayer dispatch
+            // each one leaked a call-return entry until the 1024-entry abort).
+            // Relocated bodies (source_addr != addr) keep call semantics: the
+            // target bytes are not in this image at the target's guest address.
+            if (!runtime_ram_placement && fn_source_addr == fn.addr) {
+                bool is_bl = false;
+                uint32_t bl_target = 0;
+                if (scan_ins.op == armv4t::IrOp::BL) {
+                    is_bl = true;
+                    bl_target = scan_ins.branch_target;
+                } else if (scan_ins.op == armv4t::IrOp::BL_suffix) {
+                    armv4t::Instr prefix;
+                    if (decode_image_instr(rom, rom_size, rom_base, scan_pc - 2u,
+                                           true, &prefix) &&
+                        prefix.op == armv4t::IrOp::BL_prefix) {
+                        is_bl = true;
+                        bl_target = (prefix.branch_target + scan_ins.swi_imm) & ~1u;
+                    }
+                }
+                const uint32_t link = scan_pc + step;
+                if (is_bl && bl_target != link &&
+                    link_register_dead_at(rom, rom_size, rom_base, bl_target,
+                                          fn.mode == CpuMode::Thumb)) {
+                    link_branch_targets[scan_pc] = bl_target;
+                    if (bl_target >= span.start && bl_target < span.end &&
+                        bl_target < scan_pc)
+                        backward_targets.insert(bl_target);
+                }
+            }
+            if (scan_ins.op == armv4t::IrOp::BX &&
+                have_prev_scan_ins &&
+                prev_scan_ins.op == armv4t::IrOp::LDM &&
+                prev_scan_ins.block.load &&
+                prev_scan_ins.block.writeback &&
+                prev_scan_ins.block.rn == 13 &&
+                scan_ins.rm < 16 &&
+                (prev_scan_ins.block.reg_list &
+                    static_cast<uint16_t>(1u << scan_ins.rm)) != 0) {
+                bx_c_return_pcs.insert(scan_pc);
+            }
+            if (scan_ins.op == armv4t::IrOp::BX &&
+                scan_ins.rm < 16 &&
+                lr_alias[scan_ins.rm]) {
+                bx_c_return_pcs.insert(scan_pc);
+            }
+
+            bool sets_lr_alias = false;
+            uint8_t alias_dst = 0;
+            uint8_t alias_src = 0;
+            if (plain_reg_source(scan_ins, &alias_src) &&
+                scan_ins.rd < 16 &&
+                scan_ins.cond == armv4t::Cond::AL &&
+                alias_src < 16 &&
+                lr_alias[alias_src]) {
+                sets_lr_alias = true;
+                alias_dst = scan_ins.rd;
+            }
+            invalidate_written_aliases(scan_ins, lr_alias);
+            if (sets_lr_alias) {
+                lr_alias[alias_dst] = true;
+            }
+
+            // Stage 2: record the highest PC of any non-idle-simple instruction so
+            // a later backward branch can test body cleanliness in O(1). Done after
+            // the back-edge check above so the back-edge branch (itself unsafe) does
+            // not disqualify the loop it closes.
+            if (!is_idle_simple(scan_ins)) {
+                last_unsafe_pc = static_cast<int64_t>(scan_pc);
+            }
+
+            prev_scan_ins = scan_ins;
+            have_prev_scan_ins = true;
+        }
+
+    }
+    ctx.idle_backedge_pcs = runtime_ram_placement ? nullptr : &idle_backedge_pcs;
+    ctx.link_branch_targets = &link_branch_targets;
+
+    uint32_t pc = fn.addr;
+
+    // Mid-function alias entries (resume points rolled into this host). When
+    // non-empty this function gets (1) a resume prologue that computed-goto's
+    // to the interior label for an alternate entry PC, and (2) per-instruction
+    // brace-scoping so the forward goto is legal C++ (each instruction's
+    // function-scope temporaries become block-scope, so the jump crosses no
+    // in-scope initialization). Functions WITHOUT alias entries are emitted
+    // byte-identically to before (no braces, no prologue).
+    const bool has_aliases = !fn.alias_entries.empty();
+    std::unordered_set<uint32_t> alias_set(fn.alias_entries.begin(),
+                                           fn.alias_entries.end());
+    if (has_aliases) {
+        // Resume routing FIRST so an alternate entry skips the entry hook
+        // (it is not a fresh call). runtime_dispatch sets
+        // g_runtime_resume_pc from the alias-marked dispatch-table entry.
+        appendf(out, "    if (g_runtime_resume_pc) {\n");
+        appendf(out,
+            "        uint32_t _resume = g_runtime_resume_pc;"
+            " g_runtime_resume_pc = 0u;\n");
+        appendf(out, "        switch (_resume) {\n");
+        for (uint32_t a : fn.alias_entries) {
+            appendf(out, "        case 0x%08Xu: goto L_%08X;\n", a, a);
+        }
+        appendf(out, "        default: break;\n");
+        appendf(out, "        }\n    }\n");
+    }
+
+    // Reviewed mod replacement hook. Resume aliases deliberately skip it: an
+    // IRQ/SWI resume is not a fresh guest call. A handled callback owns the
+    // complete guest call and leaves g_cpu in its return-to-caller state.
+    const uint64_t mod_hook_key =
+        (static_cast<uint64_t>(fn.addr) << 1u) |
+        (fn.mode == CpuMode::Thumb ? 1u : 0u);
+    if (!runtime_ram_placement && mod_function_hook_keys &&
+        mod_function_hook_keys->count(mod_hook_key) != 0) {
+        appendf(out,
+            "    if (gba_mod_function_entry(0x%08Xu, %du, &g_cpu)) return;\n",
+            fn.addr, fn.mode == CpuMode::Thumb ? 1 : 0);
+    }
+
+    // General function-entry hook (debug observability; see runtime_arm.h).
+    // Fires before the first instruction while R0..R3 still hold the AAPCS
+    // arguments. nullptr (default) = one not-taken branch, guest-state
+    // byte-identical. Keyed by the function entry PC so a host probe can
+    // dispatch per-function (e.g. widescreen tilemap provenance).
+    if (runtime_ram_placement) {
+        appendf(out,
+            "    if (g_runtime_fn_entry_hook) g_runtime_fn_entry_hook(_ram_base);\n");
+    } else {
+        appendf(out,
+            "    if (g_runtime_fn_entry_hook) g_runtime_fn_entry_hook(0x%08Xu);\n",
+            fn.addr);
+    }
+    for (const auto& span : spans) {
+        pc = span.start;
+        ctx.current_function_addr = span.start;
+        ctx.current_function_end_addr = span.end;
+        if (runtime_ram_placement) {
+            ctx.runtime_pc_base = "(_ram_base + " +
+                std::to_string(span.start - fn.addr) + "u)";
+        }
+        while (pc < span.end) {
+            std::size_t off = 0;
+            if (!source_offset_for(pc, step, &off)) break;
+            armv4t::Instr ins;
+            if (fn.mode == CpuMode::Thumb) {
+                uint16_t hw = static_cast<uint16_t>(
+                    rom[off] | (rom[off + 1] << 8));
+                ins = armv4t::ThumbDecoder::decode(hw, pc);
+            } else {
+                uint32_t w = static_cast<uint32_t>(rom[off])
+                    | (static_cast<uint32_t>(rom[off + 1]) << 8)
+                    | (static_cast<uint32_t>(rom[off + 2]) << 16)
+                    | (static_cast<uint32_t>(rom[off + 3]) << 24);
+                ins = armv4t::ArmDecoder::decode(w, pc);
+            }
+
+            if (backward_targets.count(pc) != 0 || alias_set.count(pc) != 0) {
+                appendf(out, "L_%08X:\n", pc);
+            }
+
+            std::string line = armv4t::format_ir(ins);
+            appendf(out, "    /* %08X  %s */\n", pc, line.c_str());
+
+            bool ni = false;
+            // A verified RAM fragment can begin at any instruction, including
+            // a BX whose preceding POP belongs to another fragment. Matching
+            // the live guest return stack is sufficient; other targets still
+            // dispatch normally.
+            ctx.force_bx_c_return = runtime_ram_placement ||
+                bx_c_return_pcs.count(pc) != 0;
+            ctx.runtime_arm_immediate = runtime_ram_placement &&
+                armv4t::ArmCodegen::supports_runtime_arm_immediate(ins);
+            std::string emitted = armv4t::ArmCodegen::emit_instr(ins, ctx, &ni);
+            if (runtime_ram_placement) {
+                uint32_t opcode = 0;
+                for (uint32_t b = 0; b < step; ++b)
+                    opcode |= uint32_t(rom[off + b]) << (8u * b);
+                std::string guard;
+                if (ctx.runtime_arm_immediate) appendf(guard,
+                    "    if (!runtime_native_ram_instruction_matches_masked("
+                    "_ram_base + %uu, 0x%08Xu, %uu, 0xFFFFF000u)) {\n"
+                    "        g_cpu.R[15] = _ram_base + %uu;\n"
+                    "        GBARECOMP_TAIL_DISPATCH(_ram_base + %uu);\n"
+                    "    }\n",
+                    pc - fn.addr, opcode, step, pc - fn.addr, pc - fn.addr);
+                else appendf(guard,
+                    "    if (!runtime_native_ram_instruction_matches("
+                    "_ram_base + %uu, 0x%08Xu, %uu)) {\n"
+                    "        g_cpu.R[15] = _ram_base + %uu;\n"
+                    "        GBARECOMP_TAIL_DISPATCH(_ram_base + %uu);\n"
+                    "    }\n",
+                    pc - fn.addr, opcode, step, pc - fn.addr, pc - fn.addr);
+                emitted = guard + emitted;
+            }
+            if (has_aliases) {
+                // Block-scope each instruction so the resume prologue's forward
+                // goto crosses no in-scope local initialization (goto-legal C++).
+                out += "    {\n";
+                out += emitted;
+                out += "    }\n";
+            } else {
+                out += emitted;
+            }
+            // emit_instr already handles all return-shaped flows
+            // (branches set PC + dispatch + return; SWI sets PC +
+            // returns; LDM with PC in list returns; LDR PC dispatches).
+            // For non-PC-writing instructions execution falls through
+            // to the next emitted block.
+            (void)ni;  // tracked for diagnostics; abort path is in the emit.
+            pc += step;
+        }
+        // Fall-through tail-call dispatch.
+        //
+        // The function body may end for two reasons:
+        //   1. A natural terminator (return, unconditional B, indirect
+        //      branch, undefined). emit_instr() already emitted PC update
+        //      + `return;`, so this trailing dispatch is dead code.
+        //   2. The decode loop hit `fn.end_addr` (clipped to the next
+        //      function's start by the finder). Execution is supposed
+        //      to FALL THROUGH into the next function — typically when
+        //      two callers enter a shared suffix at different points
+        //      (e.g., the BIOS's reset_vector and SWI 0x26's handler
+        //      share code starting at 0x8C).
+        // In case 2, without this dispatch the runtime would return to
+        // the exec loop with PC unchanged and re-dispatch the same
+        // function forever. The trailing dispatch hands control to the
+        // adjacent function via the dispatch table.
+        if (runtime_ram_placement) {
+            appendf(out,
+                "    g_cpu.R[15] = _ram_base + %uu;\n"
+                "    GBARECOMP_TAIL_DISPATCH(_ram_base + %uu);\n",
+                span.end - fn.addr, span.end - fn.addr);
+        } else {
+            appendf(out,
+                "    /* fall-through to 0x%08X */\n"
+                "    g_cpu.R[15] = 0x%08Xu;\n"
+                "    GBARECOMP_TAIL_DISPATCH(0x%08Xu);\n",
+                span.end, span.end, span.end);
+        }
+    }
+
+    return out;
+}
+
+void emit_function_body(
+    std::FILE* f, const Function& fn, const uint8_t* rom,
+    std::size_t rom_size, uint32_t rom_base,
+    const std::unordered_map<uint64_t, std::string>& func_names_by_key,
+    const std::unordered_set<uint32_t>*
+        alu_immediate_override_pcs,
+    const std::unordered_set<uint64_t>* mod_function_hook_keys) {
+    std::string body = emit_function_body_str(fn, rom, rom_size, rom_base,
+                                              func_names_by_key,
+                                              alu_immediate_override_pcs,
+                                              mod_function_hook_keys);
+    std::fwrite(body.data(), 1, body.size(), f);
+}
+
+}  // namespace gbarecomp

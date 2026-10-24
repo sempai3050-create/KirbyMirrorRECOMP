@@ -1,0 +1,1678 @@
+// arm_codegen.cpp — see arm_codegen.h.
+
+#include "arm_codegen.h"
+
+#include <cstdio>
+#include <algorithm>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace armv4t {
+
+namespace {
+
+// ─────────────────────────────────────────────────────────────────────
+// Tiny string helpers
+// ─────────────────────────────────────────────────────────────────────
+
+std::string fmt_hex32(uint32_t v) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "0x%08Xu", v);
+    return std::string(buf);
+}
+
+std::string pc_expr(uint32_t pc, const CodegenCtx& ctx) {
+    if (ctx.runtime_pc_base.empty()) return fmt_hex32(pc);
+    return "(" + ctx.runtime_pc_base + " + " +
+           fmt_hex32(pc - ctx.current_function_addr) + ")";
+}
+
+std::string label_for_addr(uint32_t v) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "L_%08X", v);
+    return std::string(buf);
+}
+
+uint64_t function_key(uint32_t addr, bool thumb) {
+    return (static_cast<uint64_t>(addr) << 1u) | (thumb ? 1u : 0u);
+}
+
+// Read a guest register in operand position. R15 returns the
+// PC-pipeline value as a literal (ARM: pc+8, THUMB: pc+4). Other
+// registers read g_cpu.R[r].
+std::string read_reg_expr(uint8_t r, const Instr& ins, const CodegenCtx& ctx) {
+    if (r == 15) {
+        uint32_t pc_val = ins.pc + (ins.thumb ? 4u : 8u);
+        return pc_expr(pc_val, ctx);
+    }
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "g_cpu.R[%u]", static_cast<unsigned>(r));
+    return std::string(buf);
+}
+
+std::string stm_pc_store_value(const Instr& ins, const CodegenCtx& ctx) {
+    if (!ins.thumb) return pc_expr(ins.pc + 12u, ctx);
+    if (ctx.runtime_pc_base.empty()) return fmt_hex32(((ins.pc + 4u) & ~2u) + 4u);
+    return "((" + pc_expr(ins.pc + 4u, ctx) + " & ~2u) + 4u)";
+}
+
+// True when this op writes PC and is NOT a branch — i.e. it incurs the
+// +2 pipeline-refill surcharge in the interpreter's cycle model (branch
+// refill is already folded into instr_cycle_base). Statically known
+// from the destination register / reg-list, so the codegen folds it into
+// the instruction's fixed cost. Mirrors interpreter.cpp's `wrote_pc &&
+// !branch_op` test.
+bool writes_pc_nonbranch(const Instr& ins) {
+    switch (ins.op) {
+        case IrOp::AND: case IrOp::EOR: case IrOp::SUB: case IrOp::RSB:
+        case IrOp::ADD: case IrOp::ADC: case IrOp::SBC: case IrOp::RSC:
+        case IrOp::ORR: case IrOp::MOV: case IrOp::BIC: case IrOp::MVN:
+            // TST/TEQ/CMP/CMN write no destination, so they are excluded.
+            return ins.rd == 15u;
+        case IrOp::LDR:  case IrOp::LDRB: case IrOp::LDRH:
+        case IrOp::LDRSB: case IrOp::LDRSH:
+            return ins.rd == 15u;
+        case IrOp::LDM:
+            // Empty-list LDM loads PC at the 0x40-stride address; a
+            // non-empty list writes PC only when R15 is in the list.
+            // (STM never writes PC — it is a separate IrOp handled by
+            // the default case below.)
+            return ins.block.reg_list == 0u ||
+                   (ins.block.reg_list & (1u << 15)) != 0u;
+        default:
+            return false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Condition wrapping
+// ─────────────────────────────────────────────────────────────────────
+
+bool cond_always(Cond c) { return c == Cond::AL; }
+bool cond_never(Cond c)  { return c == Cond::NV; }
+
+// Emit the opening of a condition guard. For AL emit nothing; for
+// NV emit a do-nothing comment (the body is unreachable). For
+// other conditions emit `if (arm_cond_passes(<N>)) {`.
+void emit_cond_open(std::ostringstream& os, Cond c) {
+    if (cond_always(c)) return;
+    if (cond_never(c)) {
+        os << "    /* cond NV — never executes */\n";
+        return;
+    }
+    os << "    if (arm_cond_passes(0x" << std::hex
+       << static_cast<unsigned>(c) << std::dec << "u)) {\n";
+}
+
+void emit_cond_close(std::ostringstream& os, Cond c) {
+    if (cond_always(c) || cond_never(c)) return;
+    os << "    }\n";
+}
+
+// Indentation under a condition wrapper. Use 8 spaces when inside
+// the `if` block, 4 when outside.
+const char* indent_for(Cond c) {
+    return (cond_always(c) || cond_never(c)) ? "    " : "        ";
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Op2 evaluation
+// ─────────────────────────────────────────────────────────────────────
+//
+// Op2Code carries:
+//   - `setup`: C statements that declare and compute the operand
+//   - `value_expr`: a C expression (variable or literal) for op2.value
+//   - `carry_expr`: a C expression for the shifter carry-out (0/1)
+//                   — `cpsr_c()` if the encoding leaves carry unchanged.
+//
+// For S=1 logical ops the caller chains carry_expr into
+// arm_set_nzc_logic. For arithmetic ops the shifter carry is
+// irrelevant; carry comes from the arithmetic itself.
+
+struct Op2Code {
+    std::string setup;
+    std::string value_expr;
+    std::string carry_expr;
+};
+
+// Per-instruction "unique name" suffix so multiple decodes in one
+// function body don't shadow. We use the PC; codegen guarantees a
+// single instruction at a given PC.
+std::string uniq_suffix(const Instr& ins) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "_%08X", ins.pc);
+    return std::string(buf);
+}
+
+// The per-instruction cycle accumulator variable name. Declared in
+// emit_instr; referenced by the body emitters (which add memory/multiply
+// cost) and by the early-exit tick sites so each control-flow path ticks
+// the instruction's cost exactly once.
+std::string cyc_var_for(const Instr& ins) {
+    return "_cyc" + uniq_suffix(ins);
+}
+
+// ── Opcode-fetch wait states ─────────────────────────────────────────
+// instr_cycle_base counts every fetch as a zero-wait 1S. The real fetch
+// cost depends on the code region (the instruction PC is static here) and
+// on WAITCNT / the EWRAM control register at run time. Regions whose
+// waits are fixed by the bus are folded to constants; EWRAM and the
+// cartridge space read the active bus's RuntimeWaitTable. Mirrors
+// Interpreter::step (Bus::code_wait), the timing oracle.
+uint32_t code_region(uint32_t pc) { return pc >> 24; }
+
+bool region_waits_dynamic(uint32_t region) {
+    return region == 0x2u || (region >= 0x8u && region <= 0xEu);
+}
+
+// Fixed-bus regions: BIOS/IWRAM/IO/OAM are 32-bit zero-wait; palette and
+// VRAM are 16-bit zero-wait (a 32-bit access takes one extra cycle).
+uint32_t region_fixed_wait(uint32_t region, bool thumb) {
+    return (!thumb && (region == 0x5u || region == 0x6u)) ? 1u : 0u;
+}
+
+std::string fetch_wait_expr(uint32_t pc, bool thumb, bool sequential) {
+    const uint32_t region = code_region(pc);
+    if (region > 0xFu) return "0u";
+    if (!region_waits_dynamic(region)) {
+        return std::to_string(region_fixed_wait(region, thumb)) + "u";
+    }
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "(uint32_t)g_runtime_waits.%c%s[%u]",
+                  sequential ? 's' : 'n', thumb ? "16" : "32",
+                  static_cast<unsigned>(region));
+    return buf;
+}
+
+// `<base>u` or `<base>u + <fetch wait>` when the wait is not a constant 0.
+std::string cost_with_fetch(uint32_t base, uint32_t pc, bool thumb,
+                            bool sequential, const CodegenCtx& ctx) {
+    std::string wait;
+    if (!ctx.runtime_pc_base.empty()) {
+        wait = "(uint32_t)g_runtime_waits.";
+        wait += sequential ? 's' : 'n';
+        wait += thumb ? "16[" : "32[";
+        wait += "(" + ctx.runtime_pc_base + " >> 24) & 15u]";
+    } else {
+        wait = fetch_wait_expr(pc, thumb, sequential);
+    }
+    if (wait == "0u") return std::to_string(base) + "u";
+    if (wait.size() > 1 && wait.back() == 'u' &&
+        wait.find_first_not_of("0123456789") == wait.size() - 1) {
+        return std::to_string(base + static_cast<uint32_t>(
+                                         std::stoul(wait))) + "u";
+    }
+    return std::to_string(base) + "u + " + wait;
+}
+
+// Pipeline refill into a statically known target: an N+S fetch pair in
+// the target region, in the (unchanged) instruction set of the branch.
+std::string static_refill_expr(uint32_t target, bool thumb) {
+    const uint32_t region = code_region(target);
+    if (region > 0xFu) return "";
+    if (!region_waits_dynamic(region)) {
+        const uint32_t w = 2u * region_fixed_wait(region, thumb);
+        return w ? std::to_string(w) + "u" : "";
+    }
+    return fetch_wait_expr(target, thumb, false) + " + " +
+           fetch_wait_expr(target, thumb, true);
+}
+
+// The GamePak prefetch buffer only runs while executing from the cartridge
+// (Bus::prefetch_stall); other code regions never adjust stalls.
+bool code_prefetchable(const Instr& ins) {
+    const uint32_t region = code_region(ins.pc);
+    return region >= 0x8u && region <= 0xDu;
+}
+
+// `_cyc += <prefetch adjustment of a `wait`-cycle stall>;` for ROM code.
+// `addr` is the data address (a multiply passes 0u: always eligible).
+std::string prefetch_adjust_stmt(const Instr& ins, const std::string& wait,
+                                 const std::string& addr,
+                                 const char* indent, const CodegenCtx& ctx) {
+    if (!code_prefetchable(ins)) return "";
+    std::ostringstream s;
+    s << indent << cyc_var_for(ins) << " += runtime_prefetch_adjust(" << wait
+      << ", " << addr << ", " << pc_expr(ins.pc, ctx) << ", "
+      << (ins.thumb ? "1u" : "0u") << ");\n";
+    return s.str();
+}
+
+// `_cyc += runtime_refill_cycles(<pc expr>, <thumb expr>);`
+std::string dynamic_refill_stmt(const Instr& ins, const std::string& pc,
+                                const std::string& thumb,
+                                const char* indent) {
+    return std::string(indent) + cyc_var_for(ins) +
+           " += runtime_refill_cycles(" + pc + ", " + thumb + ");\n";
+}
+
+Op2Code emit_op2(const Instr& ins, const CodegenCtx& ctx,
+                 const char* indent) {
+    Op2Code out;
+    if (ins.op2.kind == Op2::Kind::Imm) {
+        const std::string immediate = ctx.runtime_arm_immediate
+            ? "runtime_native_arm_immediate(" + pc_expr(ins.pc,ctx) + ")"
+            : fmt_hex32(ins.op2.imm_value);
+        // Immediate. The decoder already pre-rotated imm_value;
+        // imm_carry_out is 0/1, or 2 meaning "carry unchanged".
+        std::vector<uint32_t> live_sites;
+        if (ctx.alu_immediate_override_pcs && !ctx.runtime_pc_base.empty()) {
+            const bool ram=code_region(ins.pc)==2u || code_region(ins.pc)==3u;
+            for (uint32_t site : *ctx.alu_immediate_override_pcs) {
+                const auto region=code_region(site);
+                if (ram ? (region==2u || region==3u) : (region>=8u && region<=13u))
+                    live_sites.push_back(site);
+            }
+            std::sort(live_sites.begin(),live_sites.end());
+        }
+        if (ctx.alu_immediate_override_pcs &&
+            (ctx.runtime_pc_base.empty()
+                ? ctx.alu_immediate_override_pcs->count(ins.pc)!=0
+                : !live_sites.empty())) {
+            // Opt-in, exact-PC enhancement hook. Only configured ARM/THUMB
+            // ALU immediates route through this chokepoint; memory offsets
+            // and branch displacements remain constants.
+            std::string imm_var = "_imm" + uniq_suffix(ins);
+            std::ostringstream setup;
+            setup << indent << "uint32_t " << imm_var << " = ";
+            if (!live_sites.empty()) {
+                setup << "(";
+                for (std::size_t n=0;n<live_sites.size();++n) {
+                    if (n) setup << " || ";
+                    setup << pc_expr(ins.pc,ctx) << " == " << fmt_hex32(live_sites[n]);
+                }
+                setup << ") ? ";
+            }
+            setup << "runtime_thumb_alu_immediate("
+                  << pc_expr(ins.pc, ctx) << ", "
+                  << immediate << ")";
+            if (!live_sites.empty()) setup << " : " << immediate;
+            setup << ";\n";
+            out.setup = setup.str();
+            out.value_expr = imm_var;
+        } else {
+            out.value_expr = immediate;
+        }
+        if (ins.op2.imm_carry_out == 2u) {
+            out.carry_expr = "cpsr_c()";
+        } else {
+            out.carry_expr = (ins.op2.imm_carry_out & 1u) ? "1u" : "0u";
+        }
+        return out;
+    }
+
+    // Shifted register. We always declare _rm and _op2/_co locals
+    // even when the shift is a no-op, to keep the emit predictable.
+    const auto& sr = ins.op2.shifted;
+    std::string sfx = uniq_suffix(ins);
+    std::string rm_var = "_rm" + sfx;
+    std::string op2_var = "_op2" + sfx;
+    std::string co_var = "_co" + sfx;
+    out.value_expr = op2_var;
+    out.carry_expr = co_var;
+
+    std::ostringstream s;
+    s << indent << "uint32_t " << rm_var << " = ";
+    if (sr.by_register && sr.rm == 15 && !ins.thumb) {
+        s << pc_expr(ins.pc + 12u, ctx);
+    } else {
+        s << read_reg_expr(sr.rm, ins, ctx);
+    }
+    s << ";\n";
+    s << indent << "uint32_t " << op2_var << ";\n";
+    s << indent << "uint32_t " << co_var << ";\n";
+
+    if (sr.by_register) {
+        // Count comes from the low byte of Rs at runtime. ARM ARM
+        // register-shift rule: when Rs == R15, the count uses
+        // read_reg(R15) + 4 (i.e., pc + 12 ARM). The decoder routes
+        // through read_reg_expr which already returns pc+8; we add
+        // the extra +4 here only when Rs==15.
+        std::string count_var = "_cnt" + sfx;
+        s << indent << "uint32_t " << count_var << " = (";
+        if (sr.imm_or_rs == 15) {
+            uint32_t base = ins.pc + (ins.thumb ? 4u : 8u);
+            s << pc_expr(base + 4u, ctx);
+        } else {
+            s << "g_cpu.R[" << static_cast<unsigned>(sr.imm_or_rs) << "]";
+        }
+        s << ") & 0xFFu;\n";
+
+        // Reg-form shifts at runtime: dispatch by count.
+        switch (sr.type) {
+            case ShiftType::LSL:
+                s << indent << "if (" << count_var << " == 0)      { "
+                  << op2_var << " = " << rm_var << "; "
+                  << co_var << " = cpsr_c(); }\n";
+                s << indent << "else if (" << count_var << " < 32) { "
+                  << op2_var << " = " << rm_var << " << " << count_var << "; "
+                  << co_var << " = (" << rm_var << " >> (32u - " << count_var << ")) & 1u; }\n";
+                s << indent << "else if (" << count_var << " == 32){ "
+                  << op2_var << " = 0u; "
+                  << co_var << " = " << rm_var << " & 1u; }\n";
+                s << indent << "else                                { "
+                  << op2_var << " = 0u; " << co_var << " = 0u; }\n";
+                break;
+            case ShiftType::LSR:
+                s << indent << "if (" << count_var << " == 0)      { "
+                  << op2_var << " = " << rm_var << "; "
+                  << co_var << " = cpsr_c(); }\n";
+                s << indent << "else if (" << count_var << " < 32) { "
+                  << op2_var << " = " << rm_var << " >> " << count_var << "; "
+                  << co_var << " = (" << rm_var << " >> (" << count_var << " - 1u)) & 1u; }\n";
+                s << indent << "else if (" << count_var << " == 32){ "
+                  << op2_var << " = 0u; "
+                  << co_var << " = (" << rm_var << " >> 31) & 1u; }\n";
+                s << indent << "else                                { "
+                  << op2_var << " = 0u; " << co_var << " = 0u; }\n";
+                break;
+            case ShiftType::ASR:
+                s << indent << "if (" << count_var << " == 0)      { "
+                  << op2_var << " = " << rm_var << "; "
+                  << co_var << " = cpsr_c(); }\n";
+                s << indent << "else if (" << count_var << " < 32) { "
+                  << op2_var << " = (uint32_t)((int32_t)" << rm_var << " >> " << count_var << "); "
+                  << co_var << " = (" << rm_var << " >> (" << count_var << " - 1u)) & 1u; }\n";
+                s << indent << "else                                { "
+                  << op2_var << " = (" << rm_var << " & 0x80000000u) ? 0xFFFFFFFFu : 0u; "
+                  << co_var << " = (" << rm_var << " >> 31) & 1u; }\n";
+                break;
+            case ShiftType::ROR:
+                s << indent << "if (" << count_var << " == 0)      { "
+                  << op2_var << " = " << rm_var << "; "
+                  << co_var << " = cpsr_c(); }\n";
+                s << indent << "else { uint32_t _n = " << count_var << " & 31u; "
+                  << "if (_n == 0) { " << op2_var << " = " << rm_var << "; "
+                  << co_var << " = (" << rm_var << " >> 31) & 1u; } "
+                  << "else { " << op2_var << " = (" << rm_var << " >> _n) | (" << rm_var << " << (32u - _n)); "
+                  << co_var << " = (" << op2_var << " >> 31) & 1u; } }\n";
+                break;
+            case ShiftType::RRX:
+                // RRX from a register-form shift shouldn't occur
+                // — only imm-form ROR with count==0 produces RRX.
+                // Emit a defensive abort.
+                s << indent << "runtime_unimplemented_op(\"reg-shift RRX\", "
+                  << pc_expr(ins.pc, ctx) << ");\n";
+                s << indent << op2_var << " = 0u; " << co_var << " = 0u;\n";
+                break;
+        }
+    } else {
+        // Immediate count. Statically dispatch on type + count.
+        unsigned n = sr.imm_or_rs;
+        switch (sr.type) {
+            case ShiftType::LSL:
+                if (n == 0) {
+                    s << indent << op2_var << " = " << rm_var << ";\n";
+                    s << indent << co_var << " = cpsr_c();\n";
+                } else {
+                    s << indent << op2_var << " = " << rm_var << " << " << n << ";\n";
+                    s << indent << co_var << " = (" << rm_var << " >> " << (32 - n) << ") & 1u;\n";
+                }
+                break;
+            case ShiftType::LSR:
+                if (n == 0) {  // LSR #0 → LSR #32
+                    s << indent << op2_var << " = 0u;\n";
+                    s << indent << co_var << " = (" << rm_var << " >> 31) & 1u;\n";
+                } else {
+                    s << indent << op2_var << " = " << rm_var << " >> " << n << ";\n";
+                    s << indent << co_var << " = (" << rm_var << " >> " << (n - 1) << ") & 1u;\n";
+                }
+                break;
+            case ShiftType::ASR:
+                if (n == 0) {  // ASR #0 → ASR #32
+                    s << indent << op2_var << " = (" << rm_var << " & 0x80000000u) ? 0xFFFFFFFFu : 0u;\n";
+                    s << indent << co_var << " = (" << rm_var << " >> 31) & 1u;\n";
+                } else {
+                    s << indent << op2_var << " = (uint32_t)((int32_t)" << rm_var << " >> " << n << ");\n";
+                    s << indent << co_var << " = (" << rm_var << " >> " << (n - 1) << ") & 1u;\n";
+                }
+                break;
+            case ShiftType::ROR:
+                if (n == 0) {  // decoded as RRX, but guard anyway
+                    s << indent << op2_var << " = (" << rm_var << " >> 1) | (cpsr_c() << 31);\n";
+                    s << indent << co_var << " = " << rm_var << " & 1u;\n";
+                } else {
+                    s << indent << op2_var << " = (" << rm_var << " >> " << n
+                      << ") | (" << rm_var << " << " << (32 - n) << ");\n";
+                    s << indent << co_var << " = (" << op2_var << " >> 31) & 1u;\n";
+                }
+                break;
+            case ShiftType::RRX:
+                s << indent << op2_var << " = (" << rm_var << " >> 1) | (cpsr_c() << 31);\n";
+                s << indent << co_var << " = " << rm_var << " & 1u;\n";
+                break;
+        }
+    }
+
+    out.setup = s.str();
+    return out;
+}
+
+// Mode-privileged check matching is_priv_non_system in the interp.
+const char* mode_is_priv_non_system_expr() {
+    return "((g_cpu.cpsr & 0x1Fu) != 0x10u && (g_cpu.cpsr & 0x1Fu) != 0x1Fu)";
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Branch helper
+// ─────────────────────────────────────────────────────────────────────
+
+// Emit a direct branch to `target`. If the target is a known
+// recompiled function in the dispatch table, emit a direct call;
+// otherwise route through runtime_dispatch. In both cases also
+// update g_cpu.R[15] so any caller that reads PC after the branch
+// (e.g. via stale stack values) sees the right value.
+const uint32_t* link_branch_target(const CodegenCtx& ctx, uint32_t pc) {
+    if (!ctx.link_branch_targets) return nullptr;
+    auto it = ctx.link_branch_targets->find(pc);
+    return it == ctx.link_branch_targets->end() ? nullptr : &it->second;
+}
+
+std::string emit_direct_branch(uint32_t target, uint32_t branch_pc,
+                                bool is_link,
+                                uint32_t link_value, bool thumb_link,
+                                const CodegenCtx& ctx,
+                                const char* indent) {
+    std::ostringstream s;
+    // The cycle accumulator declared by emit_instr for this branch's PC.
+    char cycbuf[24];
+    std::snprintf(cycbuf, sizeof(cycbuf), "_cyc_%08X", branch_pc);
+    const std::string cyc(cycbuf);
+    // A link call that returns with any other PC was really a tail
+    // transfer through the callee, so do not execute link fallthrough.
+    if (is_link) {
+        // LR = next_pc (with THUMB bit if the caller is THUMB).
+        uint32_t lr = thumb_link ? (link_value | 1u) : link_value;
+        s << indent << "g_cpu.R[14] = " << pc_expr(lr, ctx) << ";\n";
+    }
+    // Set CPSR.T based on whether the recompiled target body is
+    // THUMB-emitted. We don't know that here; the dispatch
+    // function's own preamble keeps cpsr.T set by the caller. For
+    // ARM->ARM direct branches, T stays clear. For ARM->THUMB
+    // direct branches (which don't exist on ARMv4T — only BX
+    // switches modes), this would need updating.
+    s << indent << "g_cpu.R[15] = " << pc_expr(target, ctx) << ";\n";
+    // Pipeline refill into the (static) target: N+S fetches in its region,
+    // same instruction set (B/BL never switch state). Charged before every
+    // path below ticks, including the `bl next` get-PC idiom whose cost the
+    // fall-through epilogue ticks.
+    {
+        const std::string refill = ctx.runtime_pc_base.empty()
+            ? static_refill_expr(target, thumb_link)
+            : "runtime_refill_cycles(" + pc_expr(target, ctx) + ", " +
+              (thumb_link ? "1u)" : "0u)");
+        if (!refill.empty()) s << indent << cyc << " += " << refill << ";\n";
+    }
+
+    if (!is_link &&
+        target >= ctx.current_function_addr &&
+        target < ctx.current_function_end_addr &&
+        target < branch_pc) {
+        s << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_BRANCH, "
+          << pc_expr(branch_pc, ctx) << ", " << pc_expr(target, ctx)
+          << ", 0u, 0u);\n";
+        s << indent << "runtime_tick(" << cyc << ");\n";
+        // Stage 2 idle-loop elision: this backward branch closes a
+        // statically-eligible quiescent loop (see CodegenCtx::
+        // idle_backedge_pcs). Probe the runtime AFTER charging the
+        // branch cycles and just before resuming the header: if the
+        // loop is dynamically proven idle, the runtime fast-forwards
+        // the master clock by whole loop periods to one period before
+        // the next scheduled event (bit-identical — see
+        // runtime_idle_backedge), leaving us positioned at the header.
+        if (ctx.idle_backedge_pcs &&
+            ctx.idle_backedge_pcs->count(branch_pc) != 0) {
+            s << indent << "runtime_idle_backedge(" << pc_expr(target, ctx)
+              << ");\n";
+        }
+        s << indent << "goto " << label_for_addr(target) << ";\n";
+        return s.str();
+    }
+
+    if (is_link && target == link_value) {
+        // `bl` to the next instruction is a get-PC idiom. Guest
+        // execution just continues with LR set; a host C call would
+        // execute the suffix once as a callee and then fall through
+        // to it again.
+        return s.str();
+    }
+    if (is_link) {
+        s << indent << "runtime_call_push_return("
+          << pc_expr(link_value & ~1u, ctx) << ");\n";
+    }
+
+    // Branch executes here: pump its fixed cost before transferring, so
+    // the PPU/IRQ boundary lands between this branch and the target —
+    // matching the interpreter (pump branch cost, then check IRQ at the
+    // next boundary). For a link call (BL / BL_suffix) zero _cyc after,
+    // so the fall-through epilogue tick (reached when the callee C-
+    // returns) does not double-count.
+    s << indent << "runtime_tick(" << cyc << ");\n";
+    if (is_link) s << indent << cyc << " = 0u;\n";
+
+    const std::string* name = nullptr;
+    if (ctx.names_by_key && ctx.runtime_pc_base.empty()) {
+        auto it = ctx.names_by_key->find(
+            function_key(target, ctx.current_function_thumb));
+        if (it != ctx.names_by_key->end()) name = &it->second;
+    }
+    const bool self_loop = !is_link && target == ctx.current_function_addr;
+    if (self_loop) {
+        // A tight `b .` loop must not become recursive host C.
+        // Return to the dispatch loop with PC unchanged so the
+        // runtime can observe/stall the guest loop normally.
+        s << indent << "return;\n";
+        return s.str();
+    }
+    if (!is_link) {
+        // B never returns to this caller: a guaranteed tail transfer.
+        // The macro expands to exactly `<call>; return;` natively and to
+        // a musttail return under Emscripten (see runtime_arm.h).
+        if (name) {
+            s << indent << "GBARECOMP_TAIL_CALL(" << *name << ");\n";
+        } else {
+            s << indent << "GBARECOMP_TAIL_DISPATCH(" << pc_expr(target, ctx)
+              << ");\n";
+        }
+        return s.str();
+    }
+    // BL is a call: after the callee returns (its `bx lr` sets PC=LR,
+    // then C-returns), control must resume in this function's body at
+    // the next instruction. So DO NOT emit `return;` for BL — let C
+    // control fall through to the next decoded instruction.
+    if (name) {
+        s << indent << *name << "();\n";
+    } else {
+        s << indent << "runtime_dispatch(" << pc_expr(target, ctx) << ");\n";
+    }
+    s << indent << "if (g_cpu.R[15] != " << pc_expr(link_value & ~1u, ctx)
+      << ") { runtime_call_cancel_return("
+      << pc_expr(link_value & ~1u, ctx) << "); return; }\n";
+    return s.str();
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Memory access helpers
+// ─────────────────────────────────────────────────────────────────────
+
+// Emit the offset evaluation for an LDR/STR-family addressing mode.
+// `offset_var` is the C identifier that should hold the offset.
+void emit_mem_offset(std::ostringstream& s, const MemAddress& mem,
+                     const Instr& ins, const std::string& offset_var,
+                     const CodegenCtx& ctx, const char* indent) {
+    s << indent << "uint32_t " << offset_var << ";\n";
+    if (!mem.by_register) {
+        s << indent << offset_var << " = " << fmt_hex32(mem.imm_offset) << ";\n";
+        return;
+    }
+    // Shifted-register offset. Address-mode shifts always use the
+    // imm-count form (post/pre-indexed reg-form uses imm count).
+    const auto& sr = mem.reg_offset;
+    std::string rm_var = "_morm" + uniq_suffix(ins);
+    s << indent << "uint32_t " << rm_var << " = "
+      << read_reg_expr(sr.rm, ins, ctx) << ";\n";
+    unsigned n = sr.imm_or_rs;
+    switch (sr.type) {
+        case ShiftType::LSL:
+            if (n == 0) s << indent << offset_var << " = " << rm_var << ";\n";
+            else s << indent << offset_var << " = " << rm_var << " << " << n << ";\n";
+            break;
+        case ShiftType::LSR:
+            if (n == 0) s << indent << offset_var << " = 0u;\n";  // LSR #32
+            else        s << indent << offset_var << " = " << rm_var << " >> " << n << ";\n";
+            break;
+        case ShiftType::ASR:
+            if (n == 0)
+                s << indent << offset_var
+                  << " = (" << rm_var << " & 0x80000000u) ? 0xFFFFFFFFu : 0u;\n";
+            else
+                s << indent << offset_var
+                  << " = (uint32_t)((int32_t)" << rm_var << " >> " << n << ");\n";
+            break;
+        case ShiftType::ROR:
+            if (n == 0)
+                s << indent << offset_var
+                  << " = (" << rm_var << " >> 1) | (cpsr_c() << 31);\n";  // RRX
+            else
+                s << indent << offset_var
+                  << " = (" << rm_var << " >> " << n << ") | ("
+                  << rm_var << " << " << (32 - n) << ");\n";
+            break;
+        case ShiftType::RRX:
+            s << indent << offset_var
+              << " = (" << rm_var << " >> 1) | (cpsr_c() << 31);\n";
+            break;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Per-op emitters
+// ─────────────────────────────────────────────────────────────────────
+
+bool emit_data_processing(std::ostringstream& body, const Instr& ins,
+                          const CodegenCtx& ctx, const char* indent) {
+    Op2Code o2 = emit_op2(ins, ctx, indent);
+    if (!o2.setup.empty()) body << o2.setup;
+
+    bool is_test = (ins.op == IrOp::TST || ins.op == IrOp::TEQ ||
+                    ins.op == IrOp::CMP || ins.op == IrOp::CMN);
+    bool is_logical = (ins.op == IrOp::AND || ins.op == IrOp::EOR ||
+                       ins.op == IrOp::ORR || ins.op == IrOp::BIC ||
+                       ins.op == IrOp::MOV || ins.op == IrOp::MVN ||
+                       ins.op == IrOp::TST || ins.op == IrOp::TEQ);
+
+    std::string sfx = uniq_suffix(ins);
+    std::string r_var = "_r" + sfx;
+    std::string rn_var = "_rn" + sfx;
+
+    // Rn is used by all ops except MOV/MVN.
+    bool needs_rn = !(ins.op == IrOp::MOV || ins.op == IrOp::MVN);
+    if (needs_rn) {
+        // THUMB ADD/CMP Rd, PC, #imm aligns PC to 4-byte boundary
+        // (also applies for the other THUMB DP forms that use PC).
+        bool pc_align = (ins.thumb && ins.rn == 15 &&
+                          ins.op2.kind == Op2::Kind::Imm);
+        body << indent << "uint32_t " << rn_var << " = ";
+        if (!ins.thumb && ins.rn == 15 &&
+            ins.op2.kind == Op2::Kind::Shifted &&
+            ins.op2.shifted.by_register) {
+            body << pc_expr(ins.pc + 12u, ctx);
+        } else {
+            body << read_reg_expr(ins.rn, ins, ctx);
+        }
+        if (pc_align) body << " & ~3u";
+        body << ";\n";
+    }
+
+    // Compute the result.
+    body << indent << "uint32_t " << r_var << ";\n";
+    switch (ins.op) {
+        case IrOp::AND: case IrOp::TST:
+            body << indent << r_var << " = " << rn_var << " & "
+                 << o2.value_expr << ";\n";
+            break;
+        case IrOp::EOR: case IrOp::TEQ:
+            body << indent << r_var << " = " << rn_var << " ^ "
+                 << o2.value_expr << ";\n";
+            break;
+        case IrOp::ORR:
+            body << indent << r_var << " = " << rn_var << " | "
+                 << o2.value_expr << ";\n";
+            break;
+        case IrOp::BIC:
+            body << indent << r_var << " = " << rn_var << " & ~("
+                 << o2.value_expr << ");\n";
+            break;
+        case IrOp::MOV:
+            body << indent << r_var << " = " << o2.value_expr << ";\n";
+            break;
+        case IrOp::MVN:
+            body << indent << r_var << " = ~(" << o2.value_expr << ");\n";
+            break;
+        case IrOp::ADD: case IrOp::CMN:
+            body << indent << r_var << " = " << rn_var << " + "
+                 << o2.value_expr << ";\n";
+            break;
+        case IrOp::SUB: case IrOp::CMP:
+            body << indent << r_var << " = " << rn_var << " - "
+                 << o2.value_expr << ";\n";
+            break;
+        case IrOp::RSB:
+            body << indent << r_var << " = " << o2.value_expr
+                 << " - " << rn_var << ";\n";
+            break;
+        case IrOp::ADC:
+            body << indent << r_var << " = " << rn_var << " + "
+                 << o2.value_expr << " + cpsr_c();\n";
+            break;
+        case IrOp::SBC:
+            body << indent << r_var << " = " << rn_var << " - "
+                 << o2.value_expr << " - (1u - cpsr_c());\n";
+            break;
+        case IrOp::RSC:
+            body << indent << r_var << " = " << o2.value_expr
+                 << " - " << rn_var << " - (1u - cpsr_c());\n";
+            break;
+        default:
+            return false;
+    }
+
+    // Set flags. Exception return: Rd=R15 + S=1 in priv non-system
+    // mode skips flag-set and routes through runtime_exception_return.
+    bool excpt_return = ins.set_flags && (ins.rd == 15) && !is_test;
+    bool spsr_restore_test = ins.set_flags && (ins.rd == 15) && is_test;
+    if (ins.set_flags) {
+        if (excpt_return) {
+            // Exception return: don't touch flags here; restore from SPSR.
+            // Tick the instruction's cost (base + the +2 non-branch PC-write
+            // refill folded into _cyc at line ~1320) BEFORE transferring —
+            // exactly as the normal PC-write path (rd==15 below) and the LDM
+            // exception-return path (ldmfd sp!,{...pc}^) do. Omitting it made
+            // `movs/subs pc, lr` exception returns (the GBA BIOS SWI epilogue
+            // at 0x188) charge 0 instead of their 2S+1N refill — the LP-005
+            // cosim divergence: generated=0 vs interpreter reference=3.
+            body << indent << "if (" << mode_is_priv_non_system_expr() << ") {\n"
+                 << indent << "    " << cyc_var_for(ins)
+                 << " += runtime_exception_return_refill(" << r_var << ");\n"
+                 << indent << "    runtime_tick(" << cyc_var_for(ins) << ");\n"
+                 << indent << "    runtime_exception_return(" << r_var << ");\n"
+                 << indent << "    return;\n"
+                 << indent << "}\n";
+        }
+        if (is_logical) {
+            // For S=1 logical: N/Z from result, C from shifter carry.
+            body << indent << "arm_set_nzc_logic(" << r_var << ", "
+                 << o2.carry_expr << ");\n";
+        } else {
+            // Arithmetic.
+            switch (ins.op) {
+                case IrOp::ADD: case IrOp::CMN:
+                    body << indent << "arm_set_nzcv_add(" << rn_var << ", "
+                         << o2.value_expr << ", " << r_var << ");\n";
+                    break;
+                case IrOp::ADC:
+                    body << indent << "arm_set_nzcv_adc(" << rn_var << ", "
+                         << o2.value_expr << ", cpsr_c(), " << r_var << ");\n";
+                    break;
+                case IrOp::SUB: case IrOp::CMP:
+                    body << indent << "arm_set_nzcv_sub(" << rn_var << ", "
+                         << o2.value_expr << ", " << r_var << ");\n";
+                    break;
+                case IrOp::SBC:
+                    body << indent << "arm_set_nzcv_sbc(" << rn_var << ", "
+                         << o2.value_expr << ", cpsr_c(), " << r_var << ");\n";
+                    break;
+                case IrOp::RSB:
+                    body << indent << "arm_set_nzcv_sub(" << o2.value_expr
+                         << ", " << rn_var << ", " << r_var << ");\n";
+                    break;
+                case IrOp::RSC:
+                    body << indent << "arm_set_nzcv_sbc(" << o2.value_expr
+                         << ", " << rn_var << ", cpsr_c(), " << r_var << ");\n";
+                    break;
+                default: break;
+            }
+        }
+        if (spsr_restore_test) {
+            body << indent << "if (" << mode_is_priv_non_system_expr() << ") {\n"
+                 << indent << "    runtime_restore_cpsr_from_spsr();\n"
+                 << indent << "}\n";
+        }
+    }
+
+    // Writeback (non-test).
+    if (!is_test) {
+        if (ins.rd == 15) {
+            // PC writeback: not an exception return (already handled
+            // above). Detect the `mov pc, lr` return idiom (DP-MOV
+            // with Op2 = plain R14, no shift) and emit a C-return
+            // — that's the AAPCS return for THUMB-callable code and
+            // for older ARM ABIs that used MOV instead of BX. Any
+            // other PC write is a computed jump → dispatch.
+            const bool is_lr_return =
+                (ins.op == IrOp::MOV &&
+                 ins.op2.kind == Op2::Kind::Shifted &&
+                 ins.op2.shifted.rm == 14 &&
+                 !ins.op2.shifted.by_register &&
+                 ins.op2.shifted.imm_or_rs == 0);
+            std::string pc_var = "_pc" + uniq_suffix(ins);
+            body << indent << "uint32_t " << pc_var << " = " << r_var
+                 << (ins.thumb ? " & ~1u" : " & ~3u") << ";\n";
+            body << indent << "g_cpu.R[15] = " << pc_var << ";\n";
+            // PC write completes the instruction; tick its cost (incl.
+            // the +2 refill folded into _cyc and the refill fetches'
+            // wait states in the target region) before transferring.
+            body << dynamic_refill_stmt(ins, pc_var,
+                                        ins.thumb ? "1u" : "0u", indent);
+            body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
+            if (is_lr_return) {
+                body << indent << "if (runtime_call_should_return("
+                     << pc_var << ")) return;\n";
+            }
+            body << indent << "GBARECOMP_TAIL_DISPATCH(" << pc_var << ");\n";
+        } else {
+            body << indent << "g_cpu.R[" << static_cast<unsigned>(ins.rd)
+                 << "] = " << r_var << ";\n";
+        }
+    }
+    return true;
+}
+
+bool emit_branch(std::ostringstream& body, const Instr& ins,
+                 const CodegenCtx& ctx, const char* indent) {
+    switch (ins.op) {
+        case IrOp::B:
+            body << emit_direct_branch(ins.branch_target, ins.pc, false, 0,
+                                       ins.thumb, ctx, indent);
+            return true;
+        case IrOp::BL: {
+            uint32_t link = ins.pc + (ins.thumb ? 2u : 4u);
+            if (const uint32_t* target = link_branch_target(ctx, ins.pc)) {
+                uint32_t lr = ins.thumb ? (link | 1u) : link;
+                body << indent << "g_cpu.R[14] = " << pc_expr(lr, ctx) << ";\n";
+                body << emit_direct_branch(*target, ins.pc, false, 0,
+                                           ins.thumb, ctx, indent);
+                return true;
+            }
+            body << emit_direct_branch(ins.branch_target, ins.pc, true, link,
+                                       ins.thumb, ctx, indent);
+            return true;
+        }
+        case IrOp::BX: {
+            std::string sfx = uniq_suffix(ins);
+            std::string target_var = "_bxt" + sfx;
+            body << indent << "uint32_t " << target_var << " = "
+                 << read_reg_expr(ins.rm, ins, ctx) << ";\n";
+            body << indent << "g_cpu.R[15] = " << target_var << " & ~1u;\n";
+            // Commit the complete architectural branch state before ticking.
+            // runtime_tick may deliver an IRQ, whose SPSR/return PC snapshot
+            // must never observe the BX destination paired with the old
+            // instruction-set mode.
+            body << indent << "if (" << target_var
+                 << " & 1u) g_cpu.cpsr |= CPSR_T_BIT; else g_cpu.cpsr &= ~CPSR_T_BIT;\n";
+            // BX always transfers; tick its cost (with the refill fetches in
+            // the destination region and instruction set) before either the
+            // C-return or the dispatch path (both exit the function).
+            body << dynamic_refill_stmt(ins, target_var + " & ~1u",
+                                        target_var + " & 1u", indent);
+            body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
+            if (ins.rm == 14 || ctx.force_bx_c_return) {
+                // `bx lr` — the AAPCS function-return idiom. In the
+                // direct-C-call dispatch model, BL emits a real C
+                // call to the target; the target's `bx lr` is the
+                // matching C return. No dispatch, but still perform
+                // BX interworking before unwinding one host frame.
+                //
+                // Non-return BX (computed jump, trampoline, BX to a
+                // non-caller via BL/BLX from a different source)
+                // is handled by the dispatch path below.
+                body << indent << "if (runtime_call_should_return(g_cpu.R[15])) return;\n";
+            }
+            body << indent << "GBARECOMP_TAIL_DISPATCH_WITH_EXCHANGE("
+                 << target_var << ");\n";
+            return true;
+        }
+        case IrOp::BL_prefix:
+            // Upper half of THUMB BL pair: stash partial target into LR.
+            body << indent << "g_cpu.R[14] = "
+                 << pc_expr(ins.branch_target, ctx) << ";\n";
+            return true;
+        case IrOp::BL_suffix: {
+            // Lower half: target = LR + (imm11 << 1).
+            // New LR = (PC_lower + 2) | 1 so BX LR resumes in THUMB.
+            // Like ARM BL, this is a CALL — control resumes in this
+            // function after the callee's `bx lr` returns. No
+            // trailing `return;` (see emit_direct_branch comment).
+            uint32_t new_lr = (ins.pc + 2u) | 1u;
+            if (const uint32_t* target = link_branch_target(ctx, ins.pc)) {
+                // Far branch: the prefix/suffix pair's static target equals
+                // the runtime LR + offset sum (the prefix always precedes).
+                body << indent << "g_cpu.R[14] = " << pc_expr(new_lr, ctx) << ";\n";
+                body << emit_direct_branch(*target, ins.pc, false, 0,
+                                           ins.thumb, ctx, indent);
+                return true;
+            }
+            std::string sfx = uniq_suffix(ins);
+            std::string target_var = "_blt" + sfx;
+            body << indent << "uint32_t " << target_var << " = "
+                 << "(g_cpu.R[14] + " << fmt_hex32(ins.swi_imm) << ") & ~1u;\n";
+            body << indent << "g_cpu.R[14] = " << pc_expr(new_lr, ctx) << ";\n";
+            body << indent << "g_cpu.R[15] = " << target_var << ";\n";
+            body << indent << "runtime_call_push_return("
+                 << pc_expr(new_lr & ~1u, ctx) << ");\n";
+            // Pump the call's cost before transferring; zero _cyc so the
+            // fall-through epilogue tick (after the callee C-returns)
+            // does not double-count.
+            body << dynamic_refill_stmt(ins, target_var, "1u", indent);
+            body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
+            body << indent << cyc_var_for(ins) << " = 0u;\n";
+            body << indent << "runtime_dispatch(" << target_var << ");\n";
+            body << indent << "if (g_cpu.R[15] != "
+                 << pc_expr(new_lr & ~1u, ctx)
+                 << ") { runtime_call_cancel_return("
+                 << pc_expr(new_lr & ~1u, ctx) << "); return; }\n";
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+bool emit_memory(std::ostringstream& body, const Instr& ins,
+                 const CodegenCtx& ctx, const char* indent) {
+    const auto& mem = ins.mem;
+    std::string sfx = uniq_suffix(ins);
+    std::string base_var = "_base" + sfx;
+    std::string off_var = "_off" + sfx;
+    std::string ea_var = "_ea" + sfx;
+    std::string post_var = "_post" + sfx;
+
+    // Base register read. THUMB PC-rel LDR aligns PC to 4 bytes.
+    bool pc_align = (ins.thumb && mem.rn == 15);
+    body << indent << "uint32_t " << base_var << " = "
+         << read_reg_expr(mem.rn, ins, ctx);
+    if (pc_align) body << " & ~3u";
+    body << ";\n";
+
+    emit_mem_offset(body, mem, ins, off_var, ctx, indent);
+
+    body << indent << "uint32_t " << ea_var << " = "
+         << (mem.pre_indexed
+                 ? (mem.add ? (base_var + " + " + off_var)
+                            : (base_var + " - " + off_var))
+                 : base_var)
+         << ";\n";
+    body << indent << "uint32_t " << post_var << " = "
+         << (mem.add ? (base_var + " + " + off_var)
+                     : (base_var + " - " + off_var))
+         << ";\n";
+
+    // Region-aware data-access cost (single N access at the effective
+    // address; width follows the op, like the interpreter's mem_cycles).
+    unsigned access_w = 4u;
+    switch (ins.op) {
+        case IrOp::LDRB: case IrOp::STRB: case IrOp::LDRSB: access_w = 1u; break;
+        case IrOp::LDRH: case IrOp::STRH: case IrOp::LDRSH: access_w = 2u; break;
+        default: access_w = 4u; break;
+    }
+    bool is_load = (ins.op == IrOp::LDR || ins.op == IrOp::LDRB ||
+                    ins.op == IrOp::LDRH || ins.op == IrOp::LDRSB ||
+                    ins.op == IrOp::LDRSH);
+
+    const std::string mc_var = "_mc" + sfx;
+    body << indent << "uint32_t " << mc_var << " = runtime_mem_cycles("
+         << ea_var << ", " << access_w << "u, 0u);\n";
+    body << indent << cyc_var_for(ins) << " += " << mc_var << ";\n";
+    // Prefetch-buffer stall adjustment (ROM code only); a load's stall
+    // includes its trailing internal cycle.
+    body << prefetch_adjust_stmt(ins, is_load ? mc_var + " + 1u" : mc_var,
+                                 ea_var, indent, ctx);
+
+    if (is_load) {
+        std::string val_var = "_v" + sfx;
+        body << indent << "uint32_t " << val_var << ";\n";
+        switch (ins.op) {
+            case IrOp::LDR: {
+                // ARMv4T misaligned word load rotates.
+                body << indent << "{ uint32_t _w = bus_read_u32(" << ea_var
+                     << " & ~3u); uint32_t _rot = (" << ea_var << " & 3u) * 8u; "
+                     << val_var << " = (_rot == 0u) ? _w : ((_w >> _rot) | (_w << (32u - _rot))); }\n";
+                break;
+            }
+            case IrOp::LDRB:
+                body << indent << val_var << " = bus_read_u8(" << ea_var << ");\n";
+                break;
+            case IrOp::LDRH:
+                body << indent << "{ uint32_t _h = bus_read_u16(" << ea_var
+                     << " & ~1u); if (" << ea_var << " & 1u) " << val_var
+                     << " = ((_h >> 8) | (_h << 24)); else " << val_var
+                     << " = _h; }\n";
+                break;
+            case IrOp::LDRSB:
+                body << indent << val_var << " = (uint32_t)(int32_t)(int8_t)bus_read_u8("
+                     << ea_var << ");\n";
+                break;
+            case IrOp::LDRSH:
+                body << indent << "if (" << ea_var << " & 1u) " << val_var
+                     << " = (uint32_t)(int32_t)(int8_t)bus_read_u8(" << ea_var << ");\n";
+                body << indent << "else " << val_var
+                     << " = (uint32_t)(int32_t)(int16_t)bus_read_u16(" << ea_var << ");\n";
+                break;
+            default: return false;
+        }
+
+        // Writeback first (unless Rn == Rd — Rd wins on loads).
+        if (mem.writeback) {
+            body << indent << "if (" << static_cast<unsigned>(mem.rn) << "u != "
+                 << static_cast<unsigned>(ins.rd) << "u) g_cpu.R["
+                 << static_cast<unsigned>(mem.rn) << "] = "
+                 << (mem.pre_indexed ? ea_var : post_var) << ";\n";
+        } else if (!mem.pre_indexed) {
+            // Post-indexed without explicit W is still writeback.
+            body << indent << "if (" << static_cast<unsigned>(mem.rn) << "u != "
+                 << static_cast<unsigned>(ins.rd) << "u) g_cpu.R["
+                 << static_cast<unsigned>(mem.rn) << "] = " << post_var << ";\n";
+        }
+
+        // Store the loaded value into Rd. If Rd == PC, dispatch.
+        if (ins.rd == 15) {
+            body << indent << "g_cpu.R[15] = " << val_var << " & ~1u;\n";
+            body << dynamic_refill_stmt(ins, val_var + " & ~1u",
+                                        ins.thumb ? "1u" : "0u", indent);
+            body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
+            body << indent << "GBARECOMP_TAIL_DISPATCH(" << val_var << " & ~1u);\n";
+        } else {
+            body << indent << "g_cpu.R[" << static_cast<unsigned>(ins.rd)
+                 << "] = " << val_var << ";\n";
+        }
+    } else {
+        // Store form. STR of PC stores pc + 12 on ARMv4T.
+        std::string val_expr;
+        if (ins.rd == 15) {
+            val_expr = pc_expr(ins.pc + 12u, ctx);
+        } else {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "g_cpu.R[%u]",
+                          static_cast<unsigned>(ins.rd));
+            val_expr = buf;
+        }
+        switch (ins.op) {
+            case IrOp::STR:
+                body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+                     << pc_expr(ins.pc, ctx) << ", " << ea_var << " & ~3u, "
+                     << val_expr << ", 4u);\n";
+                body << indent << "bus_write_u32(" << ea_var << " & ~3u, "
+                     << val_expr << ");\n";
+                break;
+            case IrOp::STRB:
+                body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+                     << pc_expr(ins.pc, ctx) << ", " << ea_var << ", (uint32_t)("
+                     << val_expr << " & 0xFFu), 1u);\n";
+                body << indent << "bus_write_u8(" << ea_var << ", (uint8_t)("
+                     << val_expr << " & 0xFFu));\n";
+                break;
+            case IrOp::STRH:
+                body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+                     << pc_expr(ins.pc, ctx) << ", " << ea_var << " & ~1u, (uint32_t)("
+                     << val_expr << " & 0xFFFFu), 2u);\n";
+                body << indent << "bus_write_u16(" << ea_var << " & ~1u, (uint16_t)("
+                     << val_expr << " & 0xFFFFu));\n";
+                break;
+            default: return false;
+        }
+        if (mem.writeback || !mem.pre_indexed) {
+            body << indent << "g_cpu.R[" << static_cast<unsigned>(mem.rn)
+                 << "] = " << (mem.pre_indexed ? ea_var : post_var) << ";\n";
+        }
+    }
+    return true;
+}
+
+bool emit_block_transfer(std::ostringstream& body, const Instr& ins,
+                          const CodegenCtx& ctx, const char* indent) {
+    const auto& blk = ins.block;
+    if (blk.reg_list == 0) {
+        std::string sfx = uniq_suffix(ins);
+        std::string base_var = "_b" + sfx;
+        std::string addr_var = "_a" + sfx;
+        std::string fb_var = "_fb" + sfx;
+        body << indent << "uint32_t " << base_var << " = g_cpu.R["
+             << static_cast<unsigned>(blk.rn) << "];\n";
+        if (blk.add) {
+            body << indent << "uint32_t " << addr_var << " = " << base_var
+                 << (blk.pre_indexed ? " + 4u" : "") << ";\n";
+            body << indent << "uint32_t " << fb_var << " = " << base_var
+                 << " + 0x40u;\n";
+        } else {
+            body << indent << "uint32_t " << addr_var << " = " << base_var
+                 << (blk.pre_indexed ? " - 0x40u" : " - 0x3Cu") << ";\n";
+            body << indent << "uint32_t " << fb_var << " = " << base_var
+                 << " - 0x40u;\n";
+        }
+        // Empty-list LDM/STM performs a single N access at the
+        // 0x40-stride address (interpreter parity).
+        const std::string mc_var = "_mc" + sfx;
+        body << indent << "uint32_t " << mc_var << " = runtime_mem_cycles("
+             << addr_var << " & ~3u, 4u, 0u);\n";
+        body << indent << cyc_var_for(ins) << " += " << mc_var << ";\n";
+        body << prefetch_adjust_stmt(ins,
+                                     blk.load ? mc_var + " + 1u" : mc_var,
+                                     addr_var, indent, ctx);
+        if (blk.load) {
+            std::string pcv = "_pc" + sfx;
+            body << indent << "uint32_t " << pcv
+                 << " = bus_read_u32(" << addr_var << " & ~3u);\n";
+            if (blk.writeback) {
+                body << indent << "g_cpu.R[" << static_cast<unsigned>(blk.rn)
+                     << "] = " << fb_var << ";\n";
+            }
+            if (blk.s_bit) {
+                body << indent << "if (" << mode_is_priv_non_system_expr()
+                     << ") { " << cyc_var_for(ins)
+                     << " += runtime_exception_return_refill(" << pcv
+                     << " & ~1u); runtime_tick(" << cyc_var_for(ins)
+                     << "); runtime_exception_return(" << pcv
+                     << " & ~1u); return; }\n";
+            }
+            body << indent << "g_cpu.R[15] = " << pcv << " & ~1u;\n";
+            body << dynamic_refill_stmt(ins, "g_cpu.R[15]",
+                                        ins.thumb ? "1u" : "0u", indent);
+            body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
+            body << indent << "GBARECOMP_TAIL_DISPATCH(g_cpu.R[15]);\n";
+        } else {
+            body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+                 << pc_expr(ins.pc, ctx) << ", " << addr_var << " & ~3u, "
+                 << stm_pc_store_value(ins, ctx) << ", 4u);\n";
+            body << indent << "bus_write_u32(" << addr_var << " & ~3u, "
+                 << stm_pc_store_value(ins, ctx) << ");\n";
+            if (blk.writeback) {
+                body << indent << "g_cpu.R[" << static_cast<unsigned>(blk.rn)
+                     << "] = " << fb_var << ";\n";
+            }
+        }
+        return true;
+    }
+    int n = 0;
+    for (int r = 0; r < 16; ++r) if (blk.reg_list & (1u << r)) ++n;
+
+    std::string sfx = uniq_suffix(ins);
+    std::string base_var = "_b" + sfx;
+    std::string addr_var = "_a" + sfx;
+    std::string fb_var = "_fb" + sfx;
+    body << indent << "uint32_t " << base_var << " = g_cpu.R["
+         << static_cast<unsigned>(blk.rn) << "];\n";
+
+    // Start address per addressing mode.
+    if (blk.add) {
+        body << indent << "uint32_t " << addr_var << " = " << base_var
+             << (blk.pre_indexed ? " + 4u" : "") << ";\n";
+    } else {
+        body << indent << "uint32_t " << addr_var << " = " << base_var
+             << " - " << (blk.pre_indexed ? 4 * n : 4 * (n - 1)) << "u;\n";
+    }
+    body << indent << "uint32_t " << fb_var << " = "
+         << (blk.add ? (base_var + " + " + std::to_string(4 * n) + "u")
+                     : (base_var + " - " + std::to_string(4 * n) + "u"))
+         << ";\n";
+
+    bool pc_in_list = (blk.reg_list & (1u << 15)) != 0;
+
+    // First access is non-sequential (N), each subsequent access is
+    // sequential (S). Matches the interpreter's per-register cost loop,
+    // which matters over slow regions (e.g. EWRAM: 6 N vs 3 S per word).
+    bool first_access = true;
+    int highest = 0;
+    for (int r = 0; r < 16; ++r) if (blk.reg_list & (1u << r)) highest = r;
+    const std::string lo_var = "_lo" + sfx;
+    const std::string ba_var = "_ba" + sfx;
+    body << indent << "uint32_t " << lo_var << " = " << addr_var << ";\n";
+    body << indent << "uint32_t " << ba_var << " = 0u;\n";
+
+    // Iterate registers in ascending order.
+    for (int r = 0; r < 16; ++r) {
+        if (!(blk.reg_list & (1u << r))) continue;
+        body << indent << ba_var << " += runtime_mem_cycles("
+             << addr_var << " & ~3u, 4u, " << (first_access ? "0u" : "1u")
+             << ");\n";
+        first_access = false;
+        if (r == highest) {
+            // All access costs are known once the last register's access
+            // is: charge them and the block's prefetch stall (a load's
+            // includes the trailing internal cycle) before any PC-load
+            // exit below ticks the instruction.
+            body << indent << cyc_var_for(ins) << " += " << ba_var << ";\n";
+            body << prefetch_adjust_stmt(
+                ins, blk.load ? ba_var + " + 1u" : ba_var, lo_var, indent, ctx);
+        }
+        if (blk.load) {
+            if (r == 15) {
+                std::string pcv = "_pc" + sfx;
+                body << indent << "uint32_t " << pcv
+                     << " = bus_read_u32(" << addr_var << " & ~3u);\n";
+                if (blk.s_bit) {
+                    body << indent << "if (" << mode_is_priv_non_system_expr()
+                         << ") { " << cyc_var_for(ins)
+                         << " += runtime_exception_return_refill(" << pcv
+                         << " & ~1u); runtime_tick(" << cyc_var_for(ins)
+                         << "); runtime_exception_return(" << pcv
+                         << " & ~1u); return; }\n";
+                    body << indent << "g_cpu.R[15] = " << pcv << " & ~1u;\n";
+                } else {
+                    body << indent << "g_cpu.R[15] = " << pcv << " & ~1u;\n";
+                }
+            } else {
+                if (blk.s_bit && !pc_in_list) {
+                    body << indent << "runtime_write_user_reg(" << r
+                         << "u, bus_read_u32(" << addr_var
+                         << " & ~3u));\n";
+                } else {
+                    body << indent << "g_cpu.R[" << r << "] = bus_read_u32("
+                         << addr_var << " & ~3u);\n";
+                }
+            }
+        } else {
+            std::string store_val;
+            if (r == 15) {
+                store_val = stm_pc_store_value(ins, ctx);
+            } else {
+                bool store_writeback_base =
+                    blk.writeback && r == blk.rn &&
+                    (blk.reg_list & ((1u << r) - 1u)) != 0;
+                store_val = store_writeback_base
+                    ? fb_var
+                    : ((blk.s_bit ? "runtime_read_user_reg(" : "g_cpu.R[") +
+                       std::to_string(r) + (blk.s_bit ? "u)" : "]"));
+            }
+            body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+                 << pc_expr(ins.pc, ctx) << ", " << addr_var << " & ~3u, "
+                 << store_val << ", 4u);\n";
+            body << indent << "bus_write_u32(" << addr_var
+                 << " & ~3u, " << store_val << ");\n";
+        }
+        body << indent << addr_var << " += 4u;\n";
+    }
+
+    bool base_in_list = (blk.reg_list & (1u << blk.rn)) != 0;
+    if (blk.writeback && !(blk.load && base_in_list)) {
+        body << indent << "g_cpu.R[" << static_cast<unsigned>(blk.rn)
+             << "] = " << fb_var << ";\n";
+    }
+
+    if (blk.load && pc_in_list) {
+        // LDM with PC in the list is the AAPCS "function return"
+        // idiom when the base register is the stack pointer (R13):
+        // a matching prior STMFD/PUSH stored LR onto the stack, so
+        // popping into R15 is restoring the return address. Treat
+        // this exactly like `bx lr` — C-return so the caller's body
+        // continues at the instruction after the call.
+        //
+        // When the base is NOT SP, the popped PC is a computed
+        // jump (state-machine dispatch, jump tables popped from
+        // arbitrary memory). Those still need runtime_dispatch.
+        // Every path here exits the function, so tick the accumulated
+        // cost (with the refill fetches at the popped PC) once before any
+        // of them.
+        body << dynamic_refill_stmt(ins, "g_cpu.R[15]",
+                                    ins.thumb ? "1u" : "0u", indent);
+        body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
+        if (blk.rn == 13) {
+            body << indent << "if (runtime_call_should_return(g_cpu.R[15])) return;\n";
+        }
+        body << indent << "GBARECOMP_TAIL_DISPATCH(g_cpu.R[15]);\n";
+    }
+    return true;
+}
+
+bool emit_multiply(std::ostringstream& body, const Instr& ins,
+                   const CodegenCtx& ctx, const char* indent) {
+    std::string sfx = uniq_suffix(ins);
+    auto rd = static_cast<unsigned>(ins.rd);
+    auto rn = static_cast<unsigned>(ins.rn);
+    auto rm = static_cast<unsigned>(ins.rm);
+    auto rs = static_cast<unsigned>(ins.rs);
+    // Multiplier internal cycles: charged, then (ROM code) adjusted by
+    // the prefetch buffer, which keeps fetching while they run.
+    const std::string mw = "_mw" + sfx;
+    const std::string charge_mw =
+        std::string(indent) + cyc_var_for(ins) + " += " + mw + ";\n" +
+        prefetch_adjust_stmt(ins, mw, "0u", indent, ctx);
+    switch (ins.op) {
+        case IrOp::MUL: {
+            body << indent << "uint32_t " << mw << " = runtime_mul_cycles(g_cpu.R["
+                 << (ins.thumb ? rm : rs) << "], 1u, 0u);\n";
+            body << charge_mw;
+            std::string rv = "_r" + sfx;
+            body << indent << "uint32_t " << rv << " = g_cpu.R[" << rm
+                 << "] * g_cpu.R[" << rs << "];\n";
+            body << indent << "g_cpu.R[" << rd << "] = " << rv << ";\n";
+            if (ins.set_flags) body << indent << "arm_set_nz(" << rv << ");\n";
+            return true;
+        }
+        case IrOp::MLA: {
+            body << indent << "uint32_t " << mw
+                 << " = runtime_mul_cycles(g_cpu.R[" << rs << "], 1u, 1u);\n";
+            body << charge_mw;
+            std::string rv = "_r" + sfx;
+            body << indent << "uint32_t " << rv << " = g_cpu.R[" << rm
+                 << "] * g_cpu.R[" << rs << "] + g_cpu.R[" << rn << "];\n";
+            body << indent << "g_cpu.R[" << rd << "] = " << rv << ";\n";
+            if (ins.set_flags) body << indent << "arm_set_nz(" << rv << ");\n";
+            return true;
+        }
+        case IrOp::UMULL: {
+            body << indent << "uint32_t " << mw
+                 << " = runtime_mul_cycles(g_cpu.R[" << rs << "], 0u, 1u);\n";
+            body << charge_mw;
+            std::string pv = "_p" + sfx;
+            body << indent << "uint64_t " << pv << " = (uint64_t)g_cpu.R["
+                 << rm << "] * (uint64_t)g_cpu.R[" << rs << "];\n";
+            body << indent << "g_cpu.R[" << rn << "] = (uint32_t)(" << pv << " & 0xFFFFFFFFu);\n";
+            body << indent << "g_cpu.R[" << rd << "] = (uint32_t)(" << pv << " >> 32);\n";
+            if (ins.set_flags) {
+                body << indent << "{ uint32_t _c = g_cpu.cpsr & ~(CPSR_N_BIT|CPSR_Z_BIT); "
+                     << "if (" << pv << " >> 63) _c |= CPSR_N_BIT; "
+                     << "if (" << pv << " == 0) _c |= CPSR_Z_BIT; "
+                     << "g_cpu.cpsr = _c; }\n";
+            }
+            return true;
+        }
+        case IrOp::UMLAL: {
+            body << indent << "uint32_t " << mw
+                 << " = runtime_mul_cycles(g_cpu.R[" << rs << "], 0u, 2u);\n";
+            body << charge_mw;
+            std::string pv = "_p" + sfx;
+            std::string av = "_acc" + sfx;
+            std::string sv = "_sum" + sfx;
+            body << indent << "uint64_t " << pv << " = (uint64_t)g_cpu.R["
+                 << rm << "] * (uint64_t)g_cpu.R[" << rs << "];\n";
+            body << indent << "uint64_t " << av << " = ((uint64_t)g_cpu.R["
+                 << rd << "] << 32) | g_cpu.R[" << rn << "];\n";
+            body << indent << "uint64_t " << sv << " = " << av << " + " << pv << ";\n";
+            body << indent << "g_cpu.R[" << rn << "] = (uint32_t)(" << sv << " & 0xFFFFFFFFu);\n";
+            body << indent << "g_cpu.R[" << rd << "] = (uint32_t)(" << sv << " >> 32);\n";
+            if (ins.set_flags) {
+                body << indent << "{ uint32_t _c = g_cpu.cpsr & ~(CPSR_N_BIT|CPSR_Z_BIT); "
+                     << "if (" << sv << " >> 63) _c |= CPSR_N_BIT; "
+                     << "if (" << sv << " == 0) _c |= CPSR_Z_BIT; "
+                     << "g_cpu.cpsr = _c; }\n";
+            }
+            return true;
+        }
+        case IrOp::SMULL: {
+            body << indent << "uint32_t " << mw
+                 << " = runtime_mul_cycles(g_cpu.R[" << rs << "], 1u, 1u);\n";
+            body << charge_mw;
+            std::string pv = "_p" + sfx;
+            body << indent << "int64_t " << pv << " = (int64_t)(int32_t)g_cpu.R["
+                 << rm << "] * (int64_t)(int32_t)g_cpu.R[" << rs << "];\n";
+            body << indent << "g_cpu.R[" << rn << "] = (uint32_t)((uint64_t)" << pv << " & 0xFFFFFFFFu);\n";
+            body << indent << "g_cpu.R[" << rd << "] = (uint32_t)((uint64_t)" << pv << " >> 32);\n";
+            if (ins.set_flags) {
+                body << indent << "{ uint32_t _c = g_cpu.cpsr & ~(CPSR_N_BIT|CPSR_Z_BIT); "
+                     << "if ((uint64_t)" << pv << " >> 63) _c |= CPSR_N_BIT; "
+                     << "if (" << pv << " == 0) _c |= CPSR_Z_BIT; "
+                     << "g_cpu.cpsr = _c; }\n";
+            }
+            return true;
+        }
+        case IrOp::SMLAL: {
+            body << indent << "uint32_t " << mw
+                 << " = runtime_mul_cycles(g_cpu.R[" << rs << "], 1u, 2u);\n";
+            body << charge_mw;
+            std::string pv = "_p" + sfx;
+            std::string av = "_acc" + sfx;
+            std::string sv = "_sum" + sfx;
+            body << indent << "int64_t " << pv << " = (int64_t)(int32_t)g_cpu.R["
+                 << rm << "] * (int64_t)(int32_t)g_cpu.R[" << rs << "];\n";
+            body << indent << "uint64_t " << av << " = ((uint64_t)g_cpu.R["
+                 << rd << "] << 32) | g_cpu.R[" << rn << "];\n";
+            body << indent << "uint64_t " << sv << " = " << av << " + (uint64_t)" << pv << ";\n";
+            body << indent << "g_cpu.R[" << rn << "] = (uint32_t)(" << sv << " & 0xFFFFFFFFu);\n";
+            body << indent << "g_cpu.R[" << rd << "] = (uint32_t)(" << sv << " >> 32);\n";
+            if (ins.set_flags) {
+                body << indent << "{ uint32_t _c = g_cpu.cpsr & ~(CPSR_N_BIT|CPSR_Z_BIT); "
+                     << "if (" << sv << " >> 63) _c |= CPSR_N_BIT; "
+                     << "if (" << sv << " == 0) _c |= CPSR_Z_BIT; "
+                     << "g_cpu.cpsr = _c; }\n";
+            }
+            return true;
+        }
+        default: return false;
+    }
+}
+
+bool emit_swap(std::ostringstream& body, const Instr& ins,
+               const CodegenCtx& ctx, const char* indent) {
+    std::string sfx = uniq_suffix(ins);
+    // 1S+2N+1I: base 2 (1S+1I) plus the read and the write, each a
+    // non-sequential access with its own prefetch stall (read first, with
+    // the trailing I). Mirrors Interpreter::step.
+    auto charge_swap = [&](const std::string& av, unsigned width) {
+        const std::string sa = "_sa" + sfx;
+        body << indent << "uint32_t " << sa << " = runtime_mem_cycles("
+             << av << (width == 4u ? " & ~3u" : "") << ", " << width
+             << "u, 0u);\n";
+        body << indent << cyc_var_for(ins) << " += 2u * " << sa << ";\n";
+        body << prefetch_adjust_stmt(ins, sa + " + 1u", av, indent, ctx);
+        body << prefetch_adjust_stmt(ins, sa, av, indent, ctx);
+    };
+    if (ins.op == IrOp::SWP) {
+        std::string av = "_a" + sfx;
+        std::string ov = "_o" + sfx;
+        body << indent << "uint32_t " << av << " = g_cpu.R["
+             << static_cast<unsigned>(ins.rn) << "];\n";
+        charge_swap(av, 4u);
+        body << indent << "uint32_t " << ov
+             << " = bus_read_u32(" << av << " & ~3u);\n";
+        body << indent << "{ uint32_t _rot = (" << av << " & 3u) * 8u; "
+             << "if (_rot) " << ov << " = (" << ov << " >> _rot) | ("
+             << ov << " << (32u - _rot)); }\n";
+        body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+             << pc_expr(ins.pc, ctx) << ", " << av << " & ~3u, g_cpu.R["
+             << static_cast<unsigned>(ins.rm) << "], 4u);\n";
+        body << indent << "bus_write_u32(" << av << " & ~3u, g_cpu.R["
+             << static_cast<unsigned>(ins.rm) << "]);\n";
+        body << indent << "g_cpu.R[" << static_cast<unsigned>(ins.rd)
+             << "] = " << ov << ";\n";
+        return true;
+    }
+    if (ins.op == IrOp::SWPB) {
+        std::string av = "_a" + sfx;
+        std::string ov = "_o" + sfx;
+        body << indent << "uint32_t " << av << " = g_cpu.R["
+             << static_cast<unsigned>(ins.rn) << "];\n";
+        charge_swap(av, 1u);
+        body << indent << "uint8_t " << ov << " = bus_read_u8(" << av << ");\n";
+        body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+             << pc_expr(ins.pc, ctx) << ", " << av << ", (uint32_t)(g_cpu.R["
+             << static_cast<unsigned>(ins.rm) << "] & 0xFFu), 1u);\n";
+        body << indent << "bus_write_u8(" << av << ", (uint8_t)(g_cpu.R["
+             << static_cast<unsigned>(ins.rm) << "] & 0xFFu));\n";
+        body << indent << "g_cpu.R[" << static_cast<unsigned>(ins.rd)
+             << "] = " << ov << ";\n";
+        return true;
+    }
+    return false;
+}
+
+bool emit_psr(std::ostringstream& body, const Instr& ins,
+              const char* indent) {
+    if (ins.op == IrOp::MRS) {
+        const char* fn = ins.psr.spsr ? "runtime_mrs_spsr" : "runtime_mrs_cpsr";
+        body << indent << "g_cpu.R[" << static_cast<unsigned>(ins.rd)
+             << "] = " << fn << "();\n";
+        return true;
+    }
+    if (ins.op == IrOp::MSR) {
+        std::string sfx = uniq_suffix(ins);
+        std::string vv = "_msrv" + sfx;
+        body << indent << "uint32_t " << vv << ";\n";
+        if (ins.op2.kind == Op2::Kind::Imm) {
+            body << indent << vv << " = " << fmt_hex32(ins.op2.imm_value) << ";\n";
+        } else {
+            body << indent << vv << " = g_cpu.R["
+                 << static_cast<unsigned>(ins.op2.shifted.rm) << "];\n";
+        }
+        const char* fn = ins.psr.spsr ? "runtime_msr_spsr" : "runtime_msr_cpsr";
+        body << indent << fn << "(" << vv << ", " << static_cast<unsigned>(ins.psr.mask) << "u);\n";
+        return true;
+    }
+    return false;
+}
+
+bool emit_swi(std::ostringstream& body, const Instr& ins,
+              const CodegenCtx& ctx, const char* indent) {
+    body << indent << "g_cpu.R[15] = "
+         << pc_expr(ins.pc + (ins.thumb ? 2u : 4u), ctx) << ";\n";
+    body << indent << "GBARECOMP_TAIL_SWI(" << fmt_hex32(ins.swi_imm) << ");\n";
+    return true;
+}
+
+}  // namespace
+
+// ─────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────
+
+std::string ArmCodegen::emit_instr(const Instr& ins, const CodegenCtx& ctx,
+                                   bool* not_implemented) {
+    if (ctx.runtime_arm_immediate && (ctx.runtime_pc_base.empty() ||
+        !supports_runtime_arm_immediate(ins)))
+        throw std::invalid_argument("live ARM immediate requires a guarded AL non-S MOV/ADD without PC operands");
+    if (!ctx.runtime_pc_base.empty() &&
+        ((code_region(ins.pc) != 2u && code_region(ins.pc) != 3u &&
+          !(code_region(ins.pc) >= 8u && code_region(ins.pc) <= 13u)) ||
+         code_region(ctx.current_function_addr) != code_region(ins.pc))) {
+        throw std::invalid_argument("runtime PC base requires canonical RAM/cartridge IR");
+    }
+    if (not_implemented) *not_implemented = false;
+
+    if (ins.is_undefined) {
+        std::ostringstream s;
+        s << "    /* undefined instruction at 0x" << std::hex << ins.pc
+          << std::dec << " */\n";
+        s << "    runtime_unimplemented_op(\"undefined\", "
+          << pc_expr(ins.pc, ctx) << ");\n";
+        s << "    return;\n";
+        if (not_implemented) *not_implemented = false;  // explicit abort, not unhandled
+        return s.str();
+    }
+
+    if (cond_never(ins.cond)) {
+        // Never executes, but the instruction is still fetched: charge
+        // the 1S fetch and advance PC, matching the interpreter's
+        // condition-failed path (cycles_out = 1).
+        std::ostringstream s;
+        s << "    /* cond NV: never executes */\n";
+        // Fingerprint at the current pc (pre-advance) so the armed insn trace
+        // stays 1:1 with the interpreter, which fingerprints every fetched
+        // instruction including condition-failed ones (MC-HP-002).
+        s << "    g_cpu.R[15] = " << pc_expr(ins.pc, ctx) << ";\n";
+        s << "    if (g_runtime_insn_trace) runtime_insn_fp();\n";
+        s << "    g_cpu.R[15] = "
+          << pc_expr(ins.pc + (ins.thumb ? 2u : 4u), ctx) << ";\n";
+        s << "    runtime_tick("
+          << cost_with_fetch(1u, ins.pc, ins.thumb, true, ctx) << ");\n";
+        return s.str();
+    }
+
+    std::ostringstream os;
+    // The generated bodies use static PC semantics for operand reads, so
+    // keeping R15 at the current instruction PC here is only for the
+    // exception/IRQ resume state read by runtime_irq/runtime_swi.
+    os << "    g_cpu.R[15] = " << pc_expr(ins.pc, ctx) << ";\n";
+    os << "    if (runtime_should_yield()) return;\n";
+    // Per-instruction fingerprint (armed): record pre-execution state so the
+    // recomp can be diffed against the interp oracle at identical cycle counts
+    // (MC-HP-002). Placed AFTER the yield check so a yielded (not-executed)
+    // instruction is not fingerprinted. Zero cost when disarmed.
+    os << "    if (g_runtime_insn_trace) runtime_insn_fp();\n";
+
+    // Per-instruction cycle accumulator. A conditional op starts at the
+    // cond-fail cost (1S fetch) and the cond-pass block raises it to the
+    // full execute cost (an unconditional op starts there); memory/multiply
+    // ops add their runtime-dependent component. A
+    // single runtime_tick(_cyc) at the instruction boundary (epilogue
+    // below) pumps the PPU/audio/timers and delivers any pending IRQ —
+    // matching the interpreter oracle, which pumps the full cost AFTER
+    // executing and checks IRQs at the next boundary.
+    // Every cost below includes this instruction's own opcode-fetch wait
+    // states (fetch_wait_expr): S normally, N after a data access or a
+    // multiply (next_fetch_nonsequential).
+    const std::string cyc_var = cyc_var_for(ins);
+
+    // Static execute cost = base (fetch + internal cycles; branch refill
+    // folded in) + register-shift surcharge + non-branch PC-write refill.
+    // Mirrors interpreter.cpp's cost assembly. SWI ticks its own cost
+    // inside runtime_swi (after masking IRQs), so it leaves _cyc at the
+    // fetch baseline (used only on the cond-fail path).
+    std::string exec_cost_expr;
+    if (ins.op != IrOp::SWI) {
+        uint32_t exec_cost = instr_cycle_base(ins.op);
+        if (ins.op2.kind == Op2::Kind::Shifted &&
+            ins.op2.shifted.by_register) {
+            exec_cost += 1u;  // extra shifter I-cycle (register-specified shift)
+        }
+        if (writes_pc_nonbranch(ins)) {
+            exec_cost += 2u;  // pipeline refill
+        }
+        exec_cost_expr = cost_with_fetch(exec_cost, ins.pc, ins.thumb,
+                                         !next_fetch_nonsequential(ins.op), ctx);
+    }
+    // An unconditional instruction starts at its execute cost; a
+    // conditional one at the cond-fail cost (the 1S fetch), raised inside
+    // the condition block.
+    const bool unconditional =
+        cond_always(ins.cond) && !exec_cost_expr.empty();
+    os << "    uint32_t " << cyc_var << " = "
+       << (unconditional ? exec_cost_expr
+                         : cost_with_fetch(1u, ins.pc, ins.thumb, true, ctx))
+       << ";\n";
+
+    emit_cond_open(os, ins.cond);
+    const char* indent = indent_for(ins.cond);
+    if (!unconditional && !exec_cost_expr.empty()) {
+        os << indent << cyc_var << " = " << exec_cost_expr << ";\n";
+    }
+
+    bool ok = false;
+
+    switch (ins.op) {
+        case IrOp::AND: case IrOp::EOR: case IrOp::SUB: case IrOp::RSB:
+        case IrOp::ADD: case IrOp::ADC: case IrOp::SBC: case IrOp::RSC:
+        case IrOp::TST: case IrOp::TEQ: case IrOp::CMP: case IrOp::CMN:
+        case IrOp::ORR: case IrOp::MOV: case IrOp::BIC: case IrOp::MVN:
+            ok = emit_data_processing(os, ins, ctx, indent);
+            break;
+        case IrOp::B: case IrOp::BL: case IrOp::BX:
+        case IrOp::BL_prefix: case IrOp::BL_suffix:
+            ok = emit_branch(os, ins, ctx, indent);
+            break;
+        case IrOp::LDR: case IrOp::STR:
+        case IrOp::LDRB: case IrOp::STRB:
+        case IrOp::LDRH: case IrOp::STRH:
+        case IrOp::LDRSB: case IrOp::LDRSH:
+            ok = emit_memory(os, ins, ctx, indent);
+            break;
+        case IrOp::LDM: case IrOp::STM:
+            ok = emit_block_transfer(os, ins, ctx, indent);
+            break;
+        case IrOp::MUL: case IrOp::MLA:
+        case IrOp::UMULL: case IrOp::UMLAL:
+        case IrOp::SMULL: case IrOp::SMLAL:
+            ok = emit_multiply(os, ins, ctx, indent);
+            break;
+        case IrOp::SWP: case IrOp::SWPB:
+            ok = emit_swap(os, ins, ctx, indent);
+            break;
+        case IrOp::MRS: case IrOp::MSR:
+            ok = emit_psr(os, ins, indent);
+            break;
+        case IrOp::SWI:
+            ok = emit_swi(os, ins, ctx, indent);
+            break;
+        default:
+            ok = false;
+            break;
+    }
+
+    if (!ok) {
+        os << indent << "runtime_unimplemented_op(\""
+           << ir_op_name(ins.op) << "\", " << pc_expr(ins.pc, ctx) << ");\n";
+        os << indent << "return;\n";
+        if (not_implemented) *not_implemented = true;
+    }
+
+    emit_cond_close(os, ins.cond);
+
+    // Instruction boundary. Advance R15 to the next instruction so a
+    // pending IRQ delivered by the tick saves the correct return address
+    // (the stacked LR must match the interpreter, or IWRAM diverges),
+    // then pump the accumulated cost. Branch / PC-write / SWI ops have
+    // already set R15 and ticked _cyc before returning, so for them this
+    // is dead code; it is the live path for fall-through ops and the
+    // cond-fail case (where _cyc is the 1-cycle fetch baseline).
+    os << "    g_cpu.R[15] = "
+       << pc_expr(ins.pc + (ins.thumb ? 2u : 4u), ctx) << ";\n";
+    os << "    runtime_tick(" << cyc_var << ");\n";
+    return os.str();
+}
+
+CodegenResult ArmCodegen::emit_block(const std::vector<Instr>& block,
+                                     const CodegenCtx& ctx) {
+    CodegenResult r{};
+    r.emitted_count = block.size();
+    std::ostringstream os;
+    for (const auto& ins : block) {
+        bool ni = false;
+        os << emit_instr(ins, ctx, &ni);
+        if (ni) r.not_implemented = true;
+    }
+    r.text = os.str();
+    return r;
+}
+
+}  // namespace armv4t

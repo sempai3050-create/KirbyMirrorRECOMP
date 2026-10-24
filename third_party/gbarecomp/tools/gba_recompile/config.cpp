@@ -1,0 +1,1085 @@
+// config.cpp — TOML loader for gba_recompile. See config.h /
+// docs/TOML_SCHEMA.md.
+
+#include "config.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdint>
+#include <string>
+#include <string_view>
+
+#include "toml.hpp"
+#include "sha1.h"
+
+namespace gbarecomp {
+
+namespace {
+
+constexpr const char* kAbortHeader =
+    "[gba_recompile] CONFIG ERROR ";
+
+bool parse_mode(const std::string& s, CpuMode& out) {
+    if (s == "arm")   { out = CpuMode::Arm;   return true; }
+    if (s == "thumb") { out = CpuMode::Thumb; return true; }
+    return false;
+}
+
+bool parse_jt_format(const std::string& s, JumpTableFormat& out) {
+    if (s == "abs32")       { out = JumpTableFormat::Abs32;      return true; }
+    if (s == "abs16")       { out = JumpTableFormat::Abs16;      return true; }
+    if (s == "pcrel_arm")   { out = JumpTableFormat::PcrelArm;   return true; }
+    if (s == "pcrel_thumb") { out = JumpTableFormat::PcrelThumb; return true; }
+    if (s == "u8_rel_thumb") { out = JumpTableFormat::U8RelThumb; return true; }
+    if (s == "u16_rel_thumb") { out = JumpTableFormat::U16RelThumb; return true; }
+    return false;
+}
+
+bool parse_jt_mode(const std::string& s, JumpTableEntriesMode& out) {
+    if (s == "arm")   { out = JumpTableEntriesMode::Arm;   return true; }
+    if (s == "thumb") { out = JumpTableEntriesMode::Thumb; return true; }
+    if (s == "auto")  { out = JumpTableEntriesMode::Auto;  return true; }
+    return false;
+}
+
+// Hex lowercase, no `0x`. Returns empty string on length mismatch.
+std::string hex_lower(const std::string& s) {
+    std::string out = s;
+    if (out.size() > 2 && out[0] == '0' && (out[1] == 'x' || out[1] == 'X')) {
+        out.erase(0, 2);
+    }
+    for (auto& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+uint32_t get_u32_field(const toml::table& t, std::string_view key,
+                       bool required, bool& ok, std::string& err) {
+    auto node = t.get(key);
+    if (!node) {
+        if (required) {
+            ok = false;
+            err = std::string("missing required key '") +
+                  std::string(key) + "'";
+        }
+        return 0u;
+    }
+    if (auto v = node->value<int64_t>()) {
+        return static_cast<uint32_t>(*v);
+    }
+    if (auto v = node->value<std::string>()) {
+        // Allow `"0xABCD"` strings as a convenience, though
+        // TOML's bare 0xABCD is preferred.
+        const std::string s = hex_lower(*v);
+        char* end = nullptr;
+        unsigned long n = std::strtoul(s.c_str(), &end, 16);
+        if (end == s.c_str()) {
+            ok = false;
+            err = std::string("key '") + std::string(key) +
+                  "' is not a parseable integer";
+            return 0u;
+        }
+        return static_cast<uint32_t>(n);
+    }
+    ok = false;
+    err = std::string("key '") + std::string(key) +
+          "' must be an integer (decimal or hex)";
+    return 0u;
+}
+
+std::string get_string_field(const toml::table& t, std::string_view key,
+                             bool required, bool& ok, std::string& err) {
+    auto node = t.get(key);
+    if (!node) {
+        if (required) {
+            ok = false;
+            err = std::string("missing required key '") +
+                  std::string(key) + "'";
+        }
+        return std::string();
+    }
+    if (auto v = node->value<std::string>()) return *v;
+    ok = false;
+    err = std::string("key '") + std::string(key) + "' must be a string";
+    return std::string();
+}
+
+// Parse [[extra_func]] entries.
+bool parse_extra_funcs(const toml::array& arr,
+                       std::vector<ConfigExtraFunc>& out) {
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        const auto* t = arr[i].as_table();
+        if (!t) {
+            std::fprintf(stderr,
+                "%s[[extra_func]] entry %zu is not a table\n",
+                kAbortHeader, i);
+            return false;
+        }
+        ConfigExtraFunc e;
+        bool ok = true;
+        std::string err;
+        e.addr = get_u32_field(*t, "addr", true, ok, err);
+        if (!ok) {
+            std::fprintf(stderr,
+                "%s[[extra_func]] entry %zu: %s\n",
+                kAbortHeader, i, err.c_str());
+            return false;
+        }
+        e.source_addr = get_u32_field(*t, "source_addr", false, ok, err);
+        if (!ok) {
+            std::fprintf(stderr,
+                "%s[[extra_func]] entry %zu: %s\n",
+                kAbortHeader, i, err.c_str());
+            return false;
+        }
+        std::string mode_s = get_string_field(*t, "mode", true, ok, err);
+        if (!ok || !parse_mode(mode_s, e.mode)) {
+            std::fprintf(stderr,
+                "%s[[extra_func]] entry %zu: mode must be \"arm\" or "
+                "\"thumb\" (got %s)\n",
+                kAbortHeader, i, mode_s.c_str());
+            return false;
+        }
+        e.name = get_string_field(*t, "name", false, ok, err);
+        e.note = get_string_field(*t, "note", false, ok, err);
+        e.resume = (*t)["resume"].value_or(false);
+        out.push_back(std::move(e));
+    }
+    return true;
+}
+
+bool parse_resume_ranges(const toml::array& arr,
+                         std::vector<ConfigResumeRange>& out) {
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        const auto* t = arr[i].as_table();
+        if (!t) {
+            std::fprintf(stderr, "%s[[resume_range]] entry %zu is not a table\n",
+                         kAbortHeader, i);
+            return false;
+        }
+        ConfigResumeRange r;
+        bool ok = true;
+        std::string err;
+        r.start = get_u32_field(*t, "start", true, ok, err);
+        r.end = get_u32_field(*t, "end", true, ok, err);
+        std::string mode_s = get_string_field(*t, "mode", true, ok, err);
+        if (!ok || !parse_mode(mode_s, r.mode)) {
+            std::fprintf(stderr,
+                "%s[[resume_range]] entry %zu: start/end and mode "
+                "(arm or thumb) are required\n", kAbortHeader, i);
+            return false;
+        }
+        const uint32_t step = r.mode == CpuMode::Thumb ? 2u : 4u;
+        if (r.start >= r.end || (r.start % step) != 0 ||
+            (r.end % step) != 0 || r.end - r.start > 0x1000u) {
+            std::fprintf(stderr,
+                "%s[[resume_range]] entry %zu: invalid, unaligned, or larger "
+                "than 0x1000 bytes [0x%08X,0x%08X)\n",
+                kAbortHeader, i, r.start, r.end);
+            return false;
+        }
+        r.note = get_string_field(*t, "note", false, ok, err);
+        out.push_back(std::move(r));
+    }
+    return true;
+}
+
+bool parse_thumb_alu_immediate_overrides(
+        const toml::array& arr,
+        std::vector<ConfigThumbAluImmediateOverride>& out) {
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        const auto* t = arr[i].as_table();
+        if (!t) {
+            std::fprintf(stderr,
+                "%s[[thumb_alu_immediate_override]] entry %zu is not a table\n",
+                kAbortHeader, i);
+            return false;
+        }
+        ConfigThumbAluImmediateOverride entry;
+        bool ok = true;
+        std::string err;
+        entry.addr = get_u32_field(*t, "addr", true, ok, err);
+        entry.note = get_string_field(*t, "note", false, ok, err);
+        if (!ok || (entry.addr & 1u) != 0) {
+            std::fprintf(stderr,
+                "%s[[thumb_alu_immediate_override]] entry %zu: addr is "
+                "required and must be halfword-aligned\n",
+                kAbortHeader, i);
+            return false;
+        }
+        for (const auto& prior : out) {
+            if (prior.addr == entry.addr) {
+                std::fprintf(stderr,
+                    "%sduplicate [[thumb_alu_immediate_override]] at "
+                    "0x%08X\n", kAbortHeader, entry.addr);
+                return false;
+            }
+        }
+        out.push_back(std::move(entry));
+    }
+    return true;
+}
+
+bool parse_alu_immediate_overrides(
+        const toml::array& arr,
+        std::vector<ConfigAluImmediateOverride>& out) {
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        const auto* t = arr[i].as_table();
+        if (!t) {
+            std::fprintf(stderr,
+                "%s[[alu_immediate_override]] entry %zu is not a table\n",
+                kAbortHeader, i);
+            return false;
+        }
+        ConfigAluImmediateOverride entry;
+        bool ok = true;
+        std::string err;
+        entry.addr = get_u32_field(*t, "addr", true, ok, err);
+        entry.note = get_string_field(*t, "note", false, ok, err);
+        if (!ok || (entry.addr & 1u) != 0) {
+            std::fprintf(stderr,
+                "%s[[alu_immediate_override]] entry %zu: addr is required "
+                "and must be halfword-aligned\n", kAbortHeader, i);
+            return false;
+        }
+        for (const auto& prior : out) {
+            if (prior.addr == entry.addr) {
+                std::fprintf(stderr,
+                    "%sduplicate [[alu_immediate_override]] at 0x%08X\n",
+                    kAbortHeader, entry.addr);
+                return false;
+            }
+        }
+        out.push_back(std::move(entry));
+    }
+    return true;
+}
+
+bool parse_mod_function_hooks(const toml::array& arr,
+                              std::vector<ConfigModFunctionHook>& out) {
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        const auto* t = arr[i].as_table();
+        if (!t) {
+            std::fprintf(stderr,
+                "%s[[mod_function_hook]] entry %zu is not a table\n",
+                kAbortHeader, i);
+            return false;
+        }
+        ConfigModFunctionHook entry;
+        bool ok = true;
+        std::string err;
+        entry.addr = get_u32_field(*t, "addr", true, ok, err);
+        const std::string mode_s =
+            get_string_field(*t, "mode", true, ok, err);
+        entry.note = get_string_field(*t, "note", false, ok, err);
+        if (!ok || !parse_mode(mode_s, entry.mode)) {
+            std::fprintf(stderr,
+                "%s[[mod_function_hook]] entry %zu: addr and mode "
+                "(arm or thumb) are required\n", kAbortHeader, i);
+            return false;
+        }
+        const uint32_t align = entry.mode == CpuMode::Thumb ? 2u : 4u;
+        if ((entry.addr % align) != 0) {
+            std::fprintf(stderr,
+                "%s[[mod_function_hook]] entry %zu: 0x%08X is not %s "
+                "instruction-aligned\n", kAbortHeader, i, entry.addr,
+                entry.mode == CpuMode::Thumb ? "THUMB" : "ARM");
+            return false;
+        }
+        for (const auto& prior : out) {
+            if (prior.addr == entry.addr && prior.mode == entry.mode) {
+                std::fprintf(stderr,
+                    "%sduplicate [[mod_function_hook]] at 0x%08X (%s)\n",
+                    kAbortHeader, entry.addr,
+                    entry.mode == CpuMode::Thumb ? "thumb" : "arm");
+                return false;
+            }
+        }
+        out.push_back(std::move(entry));
+    }
+    return true;
+}
+
+bool parse_data_ranges(const toml::array& arr,
+                       std::vector<ConfigDataRange>& out) {
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        const auto* t = arr[i].as_table();
+        if (!t) {
+            std::fprintf(stderr,
+                "%s[[data_range]] entry %zu is not a table\n",
+                kAbortHeader, i);
+            return false;
+        }
+        ConfigDataRange r;
+        bool ok = true;
+        std::string err;
+        r.start = get_u32_field(*t, "start", true, ok, err);
+        r.end   = get_u32_field(*t, "end",   true, ok, err);
+        if (!ok) {
+            std::fprintf(stderr,
+                "%s[[data_range]] entry %zu: %s\n",
+                kAbortHeader, i, err.c_str());
+            return false;
+        }
+        if (r.start >= r.end) {
+            std::fprintf(stderr,
+                "%s[[data_range]] entry %zu: start (0x%08X) must be "
+                "strictly less than end (0x%08X)\n",
+                kAbortHeader, i, r.start, r.end);
+            return false;
+        }
+        r.note = get_string_field(*t, "note", false, ok, err);
+        out.push_back(std::move(r));
+    }
+    return true;
+}
+
+bool parse_code_copies(const toml::array& arr,
+                       std::vector<ConfigCodeCopy>& out) {
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        const auto* t = arr[i].as_table();
+        if (!t) {
+            std::fprintf(stderr,
+                "%s[[code_copy]] entry %zu is not a table\n",
+                kAbortHeader, i);
+            return false;
+        }
+        ConfigCodeCopy cc;
+        bool ok = true;
+        std::string err;
+        cc.runtime_start = get_u32_field(*t, "runtime_start", true, ok, err);
+        cc.source_start  = get_u32_field(*t, "source_start",  true, ok, err);
+        cc.size          = get_u32_field(*t, "size",          true, ok, err);
+        if (!ok) {
+            std::fprintf(stderr,
+                "%s[[code_copy]] entry %zu: %s\n",
+                kAbortHeader, i, err.c_str());
+            return false;
+        }
+        if (cc.size == 0) {
+            std::fprintf(stderr,
+                "%s[[code_copy]] entry %zu: size must be non-zero\n",
+                kAbortHeader, i);
+            return false;
+        }
+        cc.name = get_string_field(*t, "name", false, ok, err);
+        cc.note = get_string_field(*t, "note", false, ok, err);
+        out.push_back(std::move(cc));
+    }
+    return true;
+}
+
+bool parse_jump_tables(const toml::array& arr,
+                       std::vector<ConfigJumpTable>& out) {
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        const auto* t = arr[i].as_table();
+        if (!t) {
+            std::fprintf(stderr,
+                "%s[[jump_table]] entry %zu is not a table\n",
+                kAbortHeader, i);
+            return false;
+        }
+        ConfigJumpTable jt;
+        bool ok = true;
+        std::string err;
+        jt.addr   = get_u32_field(*t, "addr",   true, ok, err);
+        jt.stride = get_u32_field(*t, "stride", true, ok, err);
+        jt.count  = get_u32_field(*t, "count",  true, ok, err);
+        if (!ok) {
+            std::fprintf(stderr,
+                "%s[[jump_table]] entry %zu: %s\n",
+                kAbortHeader, i, err.c_str());
+            return false;
+        }
+        std::string fmt_s = get_string_field(*t, "format", true, ok, err);
+        if (!ok || !parse_jt_format(fmt_s, jt.format)) {
+            std::fprintf(stderr,
+                "%s[[jump_table]] entry %zu: format must be one of "
+                "abs32 / abs16 / pcrel_arm / pcrel_thumb / "
+                "u8_rel_thumb / u16_rel_thumb (got %s)\n",
+                kAbortHeader, i, fmt_s.c_str());
+            return false;
+        }
+        std::string em_s = get_string_field(*t, "entries_mode", true, ok, err);
+        if (!ok || !parse_jt_mode(em_s, jt.entries_mode)) {
+            std::fprintf(stderr,
+                "%s[[jump_table]] entry %zu: entries_mode must be "
+                "arm / thumb / auto (got %s)\n",
+                kAbortHeader, i, em_s.c_str());
+            return false;
+        }
+        // Mode/format compatibility (see schema doc).
+        if (jt.format == JumpTableFormat::U8RelThumb ||
+            jt.format == JumpTableFormat::U16RelThumb) {
+            jt.base = get_u32_field(*t, "base", true, ok, err);
+            const uint32_t width = jt.format == JumpTableFormat::U8RelThumb ? 1u : 2u;
+            if (!ok || jt.base < 4 || (jt.base & 1u) || jt.stride != width ||
+                (jt.addr & (width - 1u)) || jt.count == 0 ||
+                static_cast<uint64_t>(jt.addr) +
+                    static_cast<uint64_t>(jt.count) * width > 0xFFFFFFFFull ||
+                jt.entries_mode != JumpTableEntriesMode::Thumb) {
+                std::fprintf(stderr,
+                    "%s[[jump_table]] entry %zu: %s requires an even base "
+                    "(ADD pc address + 4), aligned addr, stride = %u, "
+                    "nonempty nonwrapping count and entries_mode = \"thumb\"\n",
+                    kAbortHeader, i, fmt_s.c_str(), width);
+                return false;
+            }
+        }
+        if (jt.format == JumpTableFormat::PcrelArm &&
+            jt.entries_mode != JumpTableEntriesMode::Arm) {
+            std::fprintf(stderr,
+                "%s[[jump_table]] entry %zu: pcrel_arm requires "
+                "entries_mode = \"arm\"\n", kAbortHeader, i);
+            return false;
+        }
+        if (jt.format == JumpTableFormat::PcrelThumb &&
+            jt.entries_mode != JumpTableEntriesMode::Thumb) {
+            std::fprintf(stderr,
+                "%s[[jump_table]] entry %zu: pcrel_thumb requires "
+                "entries_mode = \"thumb\"\n", kAbortHeader, i);
+            return false;
+        }
+        if (jt.format == JumpTableFormat::Abs16 &&
+            jt.entries_mode == JumpTableEntriesMode::Auto) {
+            std::fprintf(stderr,
+                "%s[[jump_table]] entry %zu: abs16 does not support "
+                "entries_mode = \"auto\" (16-bit pointers don't span "
+                "the interworking address space)\n",
+                kAbortHeader, i);
+            return false;
+        }
+        jt.name = get_string_field(*t, "name", false, ok, err);
+        jt.note = get_string_field(*t, "note", false, ok, err);
+        out.push_back(std::move(jt));
+    }
+    return true;
+}
+
+bool parse_exclude_funcs(const toml::array& arr,
+                          std::vector<ConfigExcludeFunc>& out) {
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        const auto* t = arr[i].as_table();
+        if (!t) {
+            std::fprintf(stderr,
+                "%s[[exclude_func]] entry %zu is not a table\n",
+                kAbortHeader, i);
+            return false;
+        }
+        ConfigExcludeFunc e;
+        bool ok = true;
+        std::string err;
+        e.addr = get_u32_field(*t, "addr", true, ok, err);
+        if (!ok) {
+            std::fprintf(stderr,
+                "%s[[exclude_func]] entry %zu: %s\n",
+                kAbortHeader, i, err.c_str());
+            return false;
+        }
+        e.reason = get_string_field(*t, "reason", true, ok, err);
+        if (!ok || e.reason.empty()) {
+            std::fprintf(stderr,
+                "%s[[exclude_func]] entry %zu: reason is required\n",
+                kAbortHeader, i);
+            return false;
+        }
+        out.push_back(std::move(e));
+    }
+    return true;
+}
+
+// Parse every supplemental array — the tables that describe the binary rather
+// than the program itself. Shared by load_config() and load_config_overlay():
+// a base config and an overlay accept exactly the same set, so the two can
+// never drift apart as tables are added.
+bool parse_supplemental_arrays(const toml::table& tbl, Config& out) {
+    if (auto ef = tbl.at_path("extra_func").as_array()) {
+        if (!parse_extra_funcs(*ef, out.extra_funcs)) return false;
+    }
+    if (auto rr = tbl.at_path("resume_range").as_array()) {
+        if (!parse_resume_ranges(*rr, out.resume_ranges)) return false;
+    }
+    if (auto imm = tbl.at_path("thumb_alu_immediate_override").as_array()) {
+        if (!parse_thumb_alu_immediate_overrides(
+                *imm, out.thumb_alu_immediate_overrides)) return false;
+    }
+    if (auto imm = tbl.at_path("alu_immediate_override").as_array()) {
+        if (!parse_alu_immediate_overrides(
+                *imm, out.alu_immediate_overrides)) return false;
+    }
+    if (auto hooks = tbl.at_path("mod_function_hook").as_array()) {
+        if (!parse_mod_function_hooks(*hooks, out.mod_function_hooks))
+            return false;
+    }
+    if (auto dr = tbl.at_path("data_range").as_array()) {
+        if (!parse_data_ranges(*dr, out.data_ranges)) return false;
+    }
+    if (auto cc = tbl.at_path("code_copy").as_array()) {
+        if (!parse_code_copies(*cc, out.code_copies)) return false;
+    }
+    if (auto jt = tbl.at_path("jump_table").as_array()) {
+        if (!parse_jump_tables(*jt, out.jump_tables)) return false;
+    }
+    if (auto ex = tbl.at_path("exclude_func").as_array()) {
+        if (!parse_exclude_funcs(*ex, out.exclude_funcs)) return false;
+    }
+    return true;
+}
+
+// Cross-section structural validation. See docs/TOML_SCHEMA.md
+// "Precedence and conflict resolution" step 2.
+bool validate_cross_section(const Config& cfg) {
+    // exclude_func + extra_func at the same addr is contradictory.
+    for (const auto& ex : cfg.exclude_funcs) {
+        for (const auto& ef : cfg.extra_funcs) {
+            if (ef.addr == ex.addr) {
+                std::fprintf(stderr,
+                    "%saddress 0x%08X is declared in BOTH "
+                    "[[extra_func]] and [[exclude_func]] — "
+                    "contradictory intent\n",
+                    kAbortHeader, ex.addr);
+                return false;
+            }
+        }
+    }
+    // extra_func addr inside a data_range is also contradictory.
+    for (const auto& ef : cfg.extra_funcs) {
+        for (const auto& dr : cfg.data_ranges) {
+            if (ef.addr >= dr.start && ef.addr < dr.end) {
+                std::fprintf(stderr,
+                    "%s[[extra_func]] at 0x%08X falls inside "
+                    "[[data_range]] [0x%08X, 0x%08X)%s%s\n",
+                    kAbortHeader, ef.addr, dr.start, dr.end,
+                    dr.note.empty() ? "" : " — ",
+                    dr.note.c_str());
+                return false;
+            }
+        }
+    }
+    for (const auto& rr : cfg.resume_ranges) {
+        const std::uint64_t program_start = cfg.program.load_address;
+        const std::uint64_t program_end =
+            program_start + static_cast<std::uint64_t>(cfg.program.size);
+        bool in_code_image = rr.start >= program_start && rr.end <= program_end;
+        for (const auto& cc : cfg.code_copies) {
+            const std::uint64_t copy_start = cc.runtime_start;
+            const std::uint64_t copy_end =
+                copy_start + static_cast<std::uint64_t>(cc.size);
+            in_code_image = in_code_image ||
+                (rr.start >= copy_start && rr.end <= copy_end);
+        }
+        if (!in_code_image) {
+            std::fprintf(stderr,
+                "%s[[resume_range]] [0x%08X,0x%08X) is outside the "
+                "program image and declared [[code_copy]] spans\n",
+                kAbortHeader, rr.start, rr.end);
+            return false;
+        }
+        for (const auto& dr : cfg.data_ranges) {
+            if (rr.start < dr.end && dr.start < rr.end) {
+                std::fprintf(stderr,
+                    "%s[[resume_range]] [0x%08X,0x%08X) overlaps "
+                    "[[data_range]] [0x%08X,0x%08X)\n",
+                    kAbortHeader, rr.start, rr.end, dr.start, dr.end);
+                return false;
+            }
+        }
+        for (const auto& ex : cfg.exclude_funcs) {
+            if (ex.addr >= rr.start && ex.addr < rr.end) {
+                std::fprintf(stderr,
+                    "%s[[exclude_func]] 0x%08X falls inside "
+                    "[[resume_range]] [0x%08X,0x%08X)\n",
+                    kAbortHeader, ex.addr, rr.start, rr.end);
+                return false;
+            }
+        }
+    }
+    for (const auto& imm : cfg.thumb_alu_immediate_overrides) {
+        const std::uint64_t program_start = cfg.program.load_address;
+        const std::uint64_t program_end =
+            program_start + static_cast<std::uint64_t>(cfg.program.size);
+        bool in_code_image = imm.addr >= program_start &&
+            static_cast<std::uint64_t>(imm.addr) + 2u <= program_end;
+        for (const auto& cc : cfg.code_copies) {
+            const std::uint64_t copy_start = cc.runtime_start;
+            const std::uint64_t copy_end =
+                copy_start + static_cast<std::uint64_t>(cc.size);
+            in_code_image = in_code_image ||
+                (imm.addr >= copy_start &&
+                 static_cast<std::uint64_t>(imm.addr) + 2u <= copy_end);
+        }
+        if (!in_code_image) {
+            std::fprintf(stderr,
+                "%s[[thumb_alu_immediate_override]] 0x%08X is outside "
+                "the program image and declared [[code_copy]] spans\n",
+                kAbortHeader, imm.addr);
+            return false;
+        }
+        for (const auto& dr : cfg.data_ranges) {
+            if (imm.addr >= dr.start && imm.addr < dr.end) {
+                std::fprintf(stderr,
+                    "%s[[thumb_alu_immediate_override]] 0x%08X falls "
+                    "inside [[data_range]] [0x%08X,0x%08X)\n",
+                    kAbortHeader, imm.addr, dr.start, dr.end);
+                return false;
+            }
+        }
+        for (const auto& ex : cfg.exclude_funcs) {
+            if (ex.addr == imm.addr) {
+                std::fprintf(stderr,
+                    "%s[[thumb_alu_immediate_override]] 0x%08X is also "
+                    "an [[exclude_func]] address\n", kAbortHeader, imm.addr);
+                return false;
+            }
+        }
+    }
+    for (const auto& imm : cfg.alu_immediate_overrides) {
+        const std::uint64_t program_start = cfg.program.load_address;
+        const std::uint64_t program_end =
+            program_start + static_cast<std::uint64_t>(cfg.program.size);
+        bool in_code_image = imm.addr >= program_start &&
+            static_cast<std::uint64_t>(imm.addr) + 2u <= program_end;
+        for (const auto& cc : cfg.code_copies) {
+            const std::uint64_t copy_start = cc.runtime_start;
+            const std::uint64_t copy_end =
+                copy_start + static_cast<std::uint64_t>(cc.size);
+            in_code_image = in_code_image ||
+                (imm.addr >= copy_start &&
+                 static_cast<std::uint64_t>(imm.addr) + 2u <= copy_end);
+        }
+        if (!in_code_image) {
+            std::fprintf(stderr,
+                "%s[[alu_immediate_override]] 0x%08X is outside the program "
+                "image and declared [[code_copy]] spans\n",
+                kAbortHeader, imm.addr);
+            return false;
+        }
+        for (const auto& dr : cfg.data_ranges) {
+            if (imm.addr >= dr.start && imm.addr < dr.end) {
+                std::fprintf(stderr,
+                    "%s[[alu_immediate_override]] 0x%08X falls inside "
+                    "[[data_range]] [0x%08X,0x%08X)\n",
+                    kAbortHeader, imm.addr, dr.start, dr.end);
+                return false;
+            }
+        }
+        for (const auto& ex : cfg.exclude_funcs) {
+            if (ex.addr == imm.addr) {
+                std::fprintf(stderr,
+                    "%s[[alu_immediate_override]] 0x%08X is also an "
+                    "[[exclude_func]] address\n", kAbortHeader, imm.addr);
+                return false;
+            }
+        }
+    }
+    for (const auto& hook : cfg.mod_function_hooks) {
+        const std::uint64_t program_start = cfg.program.load_address;
+        const std::uint64_t program_end =
+            program_start + static_cast<std::uint64_t>(cfg.program.size);
+        const uint32_t width = hook.mode == CpuMode::Thumb ? 2u : 4u;
+        bool in_code_image = hook.addr >= program_start &&
+            static_cast<std::uint64_t>(hook.addr) + width <= program_end;
+        for (const auto& cc : cfg.code_copies) {
+            const std::uint64_t copy_start = cc.runtime_start;
+            const std::uint64_t copy_end = copy_start + cc.size;
+            in_code_image = in_code_image ||
+                (hook.addr >= copy_start &&
+                 static_cast<std::uint64_t>(hook.addr) + width <= copy_end);
+        }
+        if (!in_code_image) {
+            std::fprintf(stderr,
+                "%s[[mod_function_hook]] 0x%08X is outside the program "
+                "image and declared [[code_copy]] spans\n",
+                kAbortHeader, hook.addr);
+            return false;
+        }
+        for (const auto& dr : cfg.data_ranges) {
+            if (hook.addr >= dr.start && hook.addr < dr.end) {
+                std::fprintf(stderr,
+                    "%s[[mod_function_hook]] 0x%08X falls inside "
+                    "[[data_range]] [0x%08X,0x%08X)\n", kAbortHeader,
+                    hook.addr, dr.start, dr.end);
+                return false;
+            }
+        }
+        for (const auto& ex : cfg.exclude_funcs) {
+            if (ex.addr == hook.addr) {
+                std::fprintf(stderr,
+                    "%s[[mod_function_hook]] 0x%08X is also an "
+                    "[[exclude_func]] address\n", kAbortHeader, hook.addr);
+                return false;
+            }
+        }
+        for (const auto& ef : cfg.extra_funcs) {
+            if (ef.addr == hook.addr && ef.mode != hook.mode) {
+                std::fprintf(stderr,
+                    "%s[[mod_function_hook]] 0x%08X mode=%s conflicts "
+                    "with [[extra_func]] mode=%s at the same address\n",
+                    kAbortHeader, hook.addr,
+                    hook.mode == CpuMode::Thumb ? "thumb" : "arm",
+                    ef.mode == CpuMode::Thumb ? "thumb" : "arm");
+                return false;
+            }
+        }
+    }
+    // jump_table table bytes overlapping a data_range is also wrong
+    // (the table bytes are AUTO-excluded, declaring them as data
+    // is harmless but suggests confusion — accept silently for now).
+    // Per-table entry-range vs other ranges: deferred to task #5
+    // (the finder is what reads + walks entries; cross-checks
+    // belong there).
+    return true;
+}
+
+}  // namespace
+
+bool load_config(const std::string& path, Config& out) {
+    out = Config{};
+    out.source_path = path;
+
+    toml::table tbl;
+    try {
+        tbl = toml::parse_file(path);
+    } catch (const toml::parse_error& e) {
+        std::fprintf(stderr, "%sparse error in %s: %s\n",
+                     kAbortHeader, path.c_str(), e.what());
+        return false;
+    }
+
+    // [program]
+    auto prog_node = tbl["program"];
+    if (!prog_node.is_table()) {
+        std::fprintf(stderr,
+            "%s[program] table missing in %s\n",
+            kAbortHeader, path.c_str());
+        return false;
+    }
+    {
+        const auto& t = *prog_node.as_table();
+        bool ok = true;
+        std::string err;
+        out.program.name         = get_string_field(t, "name",         false, ok, err);
+        out.program.id           = get_string_field(t, "id",           false, ok, err);
+        out.program.load_address = get_u32_field   (t, "load_address", true,  ok, err);
+        out.program.size         = get_u32_field   (t, "size",         true,  ok, err);
+        out.program.entry_pc     = get_u32_field   (t, "entry_pc",     true,  ok, err);
+        out.program.speculative_literal_harvest =
+            t["speculative_literal_harvest"].value_or(true);
+        const int64_t aot_scan_start =
+            t["aot_scan_start"].value_or<int64_t>(0);
+        const int64_t aot_scan_end =
+            t["aot_scan_end"].value_or<int64_t>(0);
+        if (aot_scan_start < 0 || aot_scan_start > 0xFFFFFFFFll ||
+            aot_scan_end < 0 || aot_scan_end > 0xFFFFFFFFll) {
+            std::fprintf(stderr,
+                "%s[program]: AOT scan bounds must fit uint32\n",
+                kAbortHeader);
+            return false;
+        }
+        out.program.aot_scan_start = static_cast<uint32_t>(aot_scan_start);
+        out.program.aot_scan_end = static_cast<uint32_t>(aot_scan_end);
+        out.program.static_resume_all =
+            t["static_resume_all"].value_or(true);
+        if ((out.program.aot_scan_start == 0) !=
+            (out.program.aot_scan_end == 0) ||
+            (out.program.aot_scan_start != 0 &&
+             out.program.aot_scan_start >= out.program.aot_scan_end)) {
+            std::fprintf(stderr,
+                "%s[program]: aot_scan_start/aot_scan_end must be an "
+                "ordered non-empty pair, or both omitted\n",
+                kAbortHeader);
+            return false;
+        }
+        const int64_t configured_shards =
+            t["codegen_shards"].value_or<int64_t>(0);
+        if (configured_shards < 0 || configured_shards > 256) {
+            std::fprintf(stderr,
+                "%s[program]: codegen_shards must be in [0, 256] "
+                "(0 means auto)\n",
+                kAbortHeader);
+            return false;
+        }
+        out.program.codegen_shards =
+            static_cast<uint32_t>(configured_shards);
+        if (!ok) {
+            std::fprintf(stderr, "%s[program]: %s\n",
+                         kAbortHeader, err.c_str());
+            return false;
+        }
+    }
+
+    // [identity]
+    auto id_node = tbl["identity"];
+    if (!id_node.is_table()) {
+        std::fprintf(stderr,
+            "%s[identity] table missing in %s\n",
+            kAbortHeader, path.c_str());
+        return false;
+    }
+    {
+        const auto& t = *id_node.as_table();
+        bool ok = true;
+        std::string err;
+        out.identity.sha1 = get_string_field(t, "sha1", true,  ok, err);
+        out.identity.md5  = get_string_field(t, "md5",  false, ok, err);
+        if (!ok) {
+            std::fprintf(stderr, "%s[identity]: %s\n",
+                         kAbortHeader, err.c_str());
+            return false;
+        }
+        if (out.identity.sha1.empty()) {
+            std::fprintf(stderr,
+                "%s[identity].sha1 is required\n", kAbortHeader);
+            return false;
+        }
+    }
+
+    if (!parse_supplemental_arrays(tbl, out)) return false;
+
+    if (!validate_cross_section(out)) return false;
+    return true;
+}
+
+bool load_config_overlay(const std::string& path, Config& base) {
+    toml::table tbl;
+    try {
+        tbl = toml::parse_file(path);
+    } catch (const toml::parse_error& e) {
+        std::fprintf(stderr, "%sparse error in overlay %s: %s\n",
+                     kAbortHeader, path.c_str(), e.what());
+        return false;
+    }
+
+    // An overlay describes bytes, never the program. Allowing [program] here
+    // would let a generated file silently redefine the load address, entry
+    // point or shard count that the hand-authored base config owns.
+    if (tbl.contains("program")) {
+        std::fprintf(stderr,
+            "%soverlay %s declares [program]; only the first --config may. "
+            "Overlays carry supplemental tables only.\n",
+            kAbortHeader, path.c_str());
+        return false;
+    }
+
+    // [identity] is optional in an overlay but must agree when present. This
+    // is the gate that keeps an imported symbol set bound to the exact binary
+    // it was derived from: a decomp's addresses mean nothing for another
+    // revision of the ROM.
+    if (auto id_node = tbl["identity"]; id_node.is_table()) {
+        const auto& t = *id_node.as_table();
+        bool ok = true;
+        std::string err;
+        const std::string sha1 = get_string_field(t, "sha1", true, ok, err);
+        if (!ok) {
+            std::fprintf(stderr, "%soverlay %s [identity]: %s\n",
+                         kAbortHeader, path.c_str(), err.c_str());
+            return false;
+        }
+        if (hex_lower(sha1) != hex_lower(base.identity.sha1)) {
+            std::fprintf(stderr,
+                "%soverlay %s was derived from a different binary:\n"
+                "  base config declares: %s\n"
+                "  overlay declares:     %s\n"
+                "Re-import the overlay from a build of THIS binary.\n",
+                kAbortHeader, path.c_str(),
+                hex_lower(base.identity.sha1).c_str(),
+                hex_lower(sha1).c_str());
+            return false;
+        }
+    }
+
+    // Parse into a scratch Config so the merge can count and report what it
+    // dropped instead of silently interleaving entries.
+    Config ov{};
+    ov.source_path = path;
+    if (!parse_supplemental_arrays(tbl, ov)) return false;
+
+    std::size_t added_funcs = 0;
+    std::size_t dropped_dup = 0, dropped_excluded = 0, dropped_in_data = 0;
+
+    // [[extra_func]]: the base wins every (addr, mode) conflict, so a
+    // hand-authored entry keeps its reviewed name and note. This mirrors the
+    // precedence the finder already applies downstream — seed_by_key is
+    // first-insert-wins and base seeds are added first.
+    for (auto& ef : ov.extra_funcs) {
+        bool skip = false;
+        for (const auto& have : base.extra_funcs) {
+            if (have.addr == ef.addr && have.mode == ef.mode) {
+                ++dropped_dup;
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
+        for (const auto& ex : base.exclude_funcs) {
+            if (ex.addr == ef.addr) {
+                // The base deliberately excluded this address. Warn rather
+                // than abort: the overlay is generated, the exclusion was
+                // reviewed, and validate_cross_section would otherwise turn
+                // every such pair into a build failure.
+                std::fprintf(stderr,
+                    "warn: overlay [[extra_func]] 0x%08X (%s) dropped — the "
+                    "base config excludes it: %s\n",
+                    ef.addr, ef.name.c_str(), ex.reason.c_str());
+                ++dropped_excluded;
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
+        for (const auto& dr : base.data_ranges) {
+            if (ef.addr >= dr.start && ef.addr < dr.end) {
+                std::fprintf(stderr,
+                    "warn: overlay [[extra_func]] 0x%08X (%s) dropped — the "
+                    "base config marks it as data [0x%08X,0x%08X)%s%s\n",
+                    ef.addr, ef.name.c_str(), dr.start, dr.end,
+                    dr.note.empty() ? "" : ": ", dr.note.c_str());
+                ++dropped_in_data;
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
+        base.extra_funcs.push_back(std::move(ef));
+        ++added_funcs;
+    }
+
+    // The remaining tables are keyed by address, so an exact duplicate is
+    // redundant rather than contradictory; keep the base's copy (with its
+    // note) and count the drop.
+    std::size_t dropped_other = 0;
+    for (auto& dr : ov.data_ranges) {
+        bool dup = false;
+        for (const auto& have : base.data_ranges) {
+            if (have.start == dr.start && have.end == dr.end) { dup = true; break; }
+        }
+        if (dup) { ++dropped_other; continue; }
+        base.data_ranges.push_back(std::move(dr));
+    }
+    for (auto& cc : ov.code_copies) {
+        bool dup = false;
+        for (const auto& have : base.code_copies) {
+            if (have.runtime_start == cc.runtime_start) { dup = true; break; }
+        }
+        if (dup) { ++dropped_other; continue; }
+        base.code_copies.push_back(std::move(cc));
+    }
+    for (auto& jt : ov.jump_tables) {
+        bool dup = false;
+        for (const auto& have : base.jump_tables) {
+            if (have.addr == jt.addr) { dup = true; break; }
+        }
+        if (dup) { ++dropped_other; continue; }
+        base.jump_tables.push_back(std::move(jt));
+    }
+    for (auto& ex : ov.exclude_funcs) {
+        bool dup = false;
+        for (const auto& have : base.exclude_funcs) {
+            if (have.addr == ex.addr) { dup = true; break; }
+        }
+        if (dup) { ++dropped_other; continue; }
+        base.exclude_funcs.push_back(std::move(ex));
+    }
+    for (auto& rr : ov.resume_ranges)  base.resume_ranges.push_back(std::move(rr));
+    for (auto& h  : ov.mod_function_hooks)
+        base.mod_function_hooks.push_back(std::move(h));
+    for (auto& i  : ov.thumb_alu_immediate_overrides)
+        base.thumb_alu_immediate_overrides.push_back(std::move(i));
+    for (auto& i  : ov.alu_immediate_overrides)
+        base.alu_immediate_overrides.push_back(std::move(i));
+
+    std::printf("[gba_recompile overlay: %s]\n", path.c_str());
+    std::printf("  extra_func:  +%zu (base wins %zu, excluded %zu, "
+                "in base data_range %zu)\n",
+                added_funcs, dropped_dup, dropped_excluded, dropped_in_data);
+    std::printf("  data_range:  +%zu   code_copy: +%zu   jump_table: +%zu\n",
+                ov.data_ranges.size(), ov.code_copies.size(),
+                ov.jump_tables.size());
+    if (dropped_other != 0) {
+        std::printf("  redundant duplicates dropped: %zu\n", dropped_other);
+    }
+
+    // Re-run the full structural check over the merged config. A base
+    // [[extra_func]] that lands inside an overlay [[data_range]] is a real
+    // contradiction between reviewed evidence and the decomp's own link
+    // layout, and it aborts here by design — resolve it, don't paper over it.
+    if (!validate_cross_section(base)) return false;
+    return true;
+}
+
+bool verify_identity(const Config& cfg,
+                      const uint8_t* binary, std::size_t binary_len) {
+    if (cfg.identity.sha1.empty()) {
+        std::fprintf(stderr,
+            "%s[identity].sha1 missing (should have been caught earlier)\n",
+            kAbortHeader);
+        return false;
+    }
+    if (binary_len != cfg.program.size) {
+        std::fprintf(stderr,
+            "%sbinary size mismatch: file is %zu bytes, "
+            "config declares %u bytes\n",
+            kAbortHeader, binary_len, cfg.program.size);
+        return false;
+    }
+    auto digest = gba::sha1(binary, binary_len);
+    std::string got = digest.hex();
+    std::string want = hex_lower(cfg.identity.sha1);
+    if (got != want) {
+        std::fprintf(stderr,
+            "%sSHA-1 mismatch:\n"
+            "  config declares: %s\n"
+            "  binary hashes:   %s\n"
+            "Either the binary is the wrong revision or the TOML\n"
+            "was authored against a different binary.\n",
+            kAbortHeader, want.c_str(), got.c_str());
+        return false;
+    }
+    return true;
+}
+
+void print_config_summary(const Config& cfg) {
+    std::printf("[gba_recompile config: %s]\n", cfg.source_path.c_str());
+    std::printf("  program:               %s (%s)\n",
+                cfg.program.name.c_str(), cfg.program.id.c_str());
+    std::printf("  load_address:          0x%08X\n", cfg.program.load_address);
+    std::printf("  size:                  0x%08X (%u bytes)\n",
+                cfg.program.size, cfg.program.size);
+    std::printf("  entry_pc:              0x%08X\n", cfg.program.entry_pc);
+    std::printf("  speculative literals:  %s\n",
+                cfg.program.speculative_literal_harvest
+                    ? "enabled" : "disabled");
+    if (cfg.program.aot_scan_start != 0) {
+        std::printf("  AOT scan range:         [0x%08X,0x%08X)\n",
+                    cfg.program.aot_scan_start,
+                    cfg.program.aot_scan_end);
+    } else {
+        std::printf("  AOT scan range:         disabled\n");
+    }
+    std::printf("  static resume all:      %s\n",
+                cfg.program.static_resume_all ? "enabled" : "disabled");
+    if (cfg.program.codegen_shards == 0) {
+        std::printf("  codegen shards:         auto\n");
+    } else {
+        std::printf("  codegen shards:         %u\n",
+                    cfg.program.codegen_shards);
+    }
+    std::printf("  identity sha1:         %s (verified)\n",
+                hex_lower(cfg.identity.sha1).c_str());
+    std::printf("  extra_func entries:    %zu\n", cfg.extra_funcs.size());
+    std::printf("  resume_range entries:  %zu\n", cfg.resume_ranges.size());
+    std::printf("  thumb immediate hooks: %zu\n",
+                cfg.thumb_alu_immediate_overrides.size());
+    std::printf("  ALU immediate hooks:   %zu\n",
+                cfg.alu_immediate_overrides.size());
+    std::printf("  mod function hooks:    %zu\n",
+                cfg.mod_function_hooks.size());
+    std::printf("  data_range entries:    %zu\n", cfg.data_ranges.size());
+    std::printf("  code_copy entries:     %zu\n", cfg.code_copies.size());
+    std::printf("  jump_table entries:    %zu\n", cfg.jump_tables.size());
+    std::printf("  exclude_func entries:  %zu\n", cfg.exclude_funcs.size());
+}
+
+}  // namespace gbarecomp

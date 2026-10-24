@@ -1,0 +1,43 @@
+# GBA HLE implementation policy
+
+The shared [HLE policy](../../recomp-template/HLE.md) applies verbatim.
+Use [OPTIMIZATION.md](../../recomp-template/OPTIMIZATION.md) to distinguish
+exact host-cost removal, exact replacement and deliberate approximation.
+
+Maintain the functioning real-BIOS/guest/device LLE configuration in current
+source. Developers choose replacements at build time, per component. Qualified
+HLE may be the preferred build. Define actual caller inputs, results, required
+registers/memory, continuation, completion and ordering. Whole services and
+different private state are allowed; individual original instructions, scratch
+buffers and internal stalls need not be reproduced. Small practically
+unnoticeable differences are allowed for substantial measured benefit.
+
+No live HLE/LLE switching, continuous comparison, duplicate LLE state, automatic
+per-call fallback, or cross-build savestate compatibility is required. Existing
+legacy BIOS flags and audio shadows are not the architecture for new services.
+Retain them truthfully until separately migrated; they are not newly qualified
+by this documentation update.
+
+`GBARECOMP_SCANLINE_IMPLEMENTATION=HLE|LLE` selects the shared compositor at
+configure time. HLE uses tile-span decoding, per-line window preparation and
+native-color candidate composition. This replacement preserves the same pixel
+and timing contract; it needs exact comparisons despite its historical HLE name.
+LLE retains the original per-pixel renderer. The build selection enters netplay
+build identity; no cross-build compatibility is inferred from compilation.
+
+Internal resolution is a separate optional presentation feature. It leaves the
+native framebuffer, guest memory, emulated time and simulation state unchanged.
+Host pixels, surface allocation and interpolation history are not serialized
+into canonical snapshots. Reset/restore/resize invalidates incomplete enhanced
+frames. Unsupported scenes retain their ordinary rendered content.
+See [the implementation and validation guide](docs/INTERNAL_RESOLUTION.md).
+
+For netplay, follow [NETPLAY.md](../../recomp-template/NETPLAY.md). Qualified
+peers agree on simulation semantics and actual capabilities before frame 0;
+host clocks, thread completion and GPU readiness must never decide guest
+results. Local quality can differ only while entirely downstream of simulation.
+Do not assume HLE/LLE cross-play or expose unqualified replacements online.
+
+Use focused tests, meaningful boundary comparisons and bounded game samples.
+Measure actual emulation/presentation work per useful frame. Record limitations
+and failed experiments; a smaller instruction count alone is not a speedup.
